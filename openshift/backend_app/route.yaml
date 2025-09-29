@@ -1,0 +1,16 @@
+kind: Route
+apiVersion: route.openshift.io/v1
+metadata:
+  annotations:
+  name: test-app-backend-route
+  labels:
+    app: test-app-backend
+spec:
+  host: test-app-backend-${global.multiClusters.openshiftNewRoute}
+  to:
+    kind: Service
+    name: test-app-backend
+    weight: 100
+  port:
+    targetPort: 8080-tcp
+  wildcardPolicy: None

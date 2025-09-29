@@ -1,0 +1,66 @@
+### Настройки MAVEN ###
+maven:
+  settings_id: "settings"
+  home: "Maven 3.9.6"
+  jdk: "openjdk-21"
+  use_for_deploy: true
+
+### Настройки NodeJS ###
+npm:
+  config_id: "npm_config"
+  version: "v20.9.0-linux-x64"
+
+### Свойства вашего дистрибутива ###
+fp:
+  groupId: "io.github.ObraztsovOleg"
+  artifactId: "efs-devops-pipeline" ## КЭ для которого есть область в  https://sbrf-nexus.sigma.sbrf.ru/nexus/
+  version: "1.0.0" # любая
+  component_code: cije
+
+bh:
+  - name: test.app.backend.sonar
+    repo: ssh://git@sberworks.ru:7998/cije/test.app.backend.git
+    branch: localjenkins
+    prod_branch: stable
+    cmd:
+      - "clean install -U -P build-config,spring"
+    sonarPomConfigured: false
+    sonarSkip: false
+    create_tag: false
+    outputs: [
+        "target/*.war",
+        "mod/module_test/*"
+    ]
+    update_version: false
+    skip_rn: "false"
+    
+nexus:
+  creds: "deploy-creds" # id (создадим позже) ТУЗа, c доступом на чтение из:
+  use_maven: true
+
+
+distribution:
+  - type: maven
+    url: "https://maven.pkg.github.com/ObraztsovOleg/maven"
+    serverId: "nexus_cd"
+
+qgm:
+  repository: "Nexus_PROD"
+  creds: "deploy-creds"
+
+### Настройки сборки Dockerfile ###
+docker:
+  builder_token: "deploy-creds" # id ТУЗа с доступ на запись в nexus3
+  registry_address: "docker.io"
+  nexus_url: "k32nc23423" # путь до вашей области с образами
+  additional_registries:
+    - "https://index.docker.io/v1/"
+
+downloads:
+  - source: git
+    type: conf
+    repo: ssh://git@sberworks.ru:7998/cije/version.conf.git
+    branch: elk
+
+extensions:
+  - "makeReleaseNotes"
