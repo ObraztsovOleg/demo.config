@@ -24,14 +24,14 @@ bh:
     cmd:
       - "clean install -U -P build-config,spring"
     sonarPomConfigured: false
-    sonarSkip: false
+    sonarSkip: true
     create_tag: false
     outputs: [
         "target/*.war",
         "mod/module_test/*"
     ]
     update_version: false
-    skip_rn: "false"
+    skip_rn: true
     
 nexus:
   creds: "deploy-creds" # id (создадим позже) ТУЗа, c доступом на чтение из:
