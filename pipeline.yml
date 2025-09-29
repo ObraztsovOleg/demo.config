@@ -19,7 +19,7 @@ fp:
 
 bh:
   - name: test.app.backend.sonar
-    repo: git@github.com:ObraztsovOleg/test.backend.git
+    repo: ssh://git@github.com/ObraztsovOleg/test.backend.git
     branch: master
     cmd:
       - "clean install -U -P build-config,spring"
