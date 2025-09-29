@@ -60,5 +60,5 @@ downloads:
     repo: ssh://git@sberworks.ru:7998/cije/version.conf.git
     branch: elk
 
-extensions:
+disabled_extensions:
   - "makeReleaseNotes"
