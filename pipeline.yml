@@ -27,8 +27,7 @@ bh:
     sonarSkip: true
     create_tag: false
     outputs: [
-        "target/*.war",
-        "mod/module_test/*"
+        "target/*.war"
     ]
     update_version: false
     skip_rn: true
