@@ -14,7 +14,7 @@ npm:
 fp:
   groupId: "io.github.ObraztsovOleg"
   artifactId: "efs-devops-pipeline" ## КЭ для которого есть область в  https://sbrf-nexus.sigma.sbrf.ru/nexus/
-  version: "1.0.0" # любая
+  version: "D-1.0.0" # любая
   component_code: cije
 
 bh:
