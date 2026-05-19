@@ -54,11 +54,6 @@ docker:
   additional_registries:
     - "https://index.docker.io/v1/"
 
-downloads:
-  - source: git
-    type: conf
-    repo: ssh://git@sberworks.ru:7998/cije/version.conf.git
-    branch: elk
 
 disabled_extensions:
   - "makeReleaseNotes"
