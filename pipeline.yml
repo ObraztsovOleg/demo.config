@@ -58,3 +58,4 @@ docker:
 disabled_extensions:
   - "makeReleaseNotes"
   - "uploadQGFlags"
+  - "updateVersionConf"
