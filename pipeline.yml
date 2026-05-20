@@ -48,7 +48,7 @@ qgm:
 
 ### Настройки сборки Dockerfile ###
 docker:
-  builder_token: "deploy-creds" # id ТУЗа с доступ на запись в nexus3
+  builder_token: "deploy-docker" # id ТУЗа с доступ на запись в nexus3
   registry_address: "docker.io"
   nexus_url: "k32nc23423" # путь до вашей области с образами
   additional_registries:
