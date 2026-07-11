@@ -402,7 +402,7 @@ def prepareDockerProjectEntries(def globals, def cacheContext, def sourceDirs, d
             contextDir: contextDir,
             sbomPath: "${projectDir}/${defaultSbomName}",
             keyInfo: [projectId: projectId],
-            cacheMounts: [[id: "sbom-maven-${projectId}", target: "/root/.m2"]]
+            cacheMounts: [[id: "sbom-maven-${projectId}", target: "/home/cyclonedx/.m2"]]
         ]
     }
 }
@@ -657,30 +657,30 @@ def runCdxgenWithDockerCacheBatch(def cacheContext, def entries, def cdxgenArgs,
     def batchId = UUID.randomUUID().toString()
     def dockerfilePath = "${cacheContext.dir}/Dockerfile.batch.${batchId}"
     def outputDir = "${cacheContext.dir}/output-batch-${batchId}"
-    def secretMounts = envParamsPath ? "--mount=type=secret,id=envParams" : ""
+    def secretMounts = envParamsPath ? "--mount=type=secret,id=envParams,uid=1000,gid=1000,mode=0400" : ""
     if (mavenSettingsPath) {
-        secretMounts = [secretMounts, "--mount=type=secret,id=maven_settings"].findAll { it }.join(" ")
+        secretMounts = [secretMounts, "--mount=type=secret,id=maven_settings,uid=1000,gid=1000,mode=0400"].findAll { it }.join(" ")
     }
     def envParamsExport = envParamsPath ? ". /run/secrets/envParams; " : ""
-    def settingsExport = mavenSettingsPath ? 'export MVN_ARGS="${MVN_ARGS:-} -s /run/secrets/maven_settings"; ' : ""
+    def settingsExport = mavenSettingsPath ? 'export MVN_ARGS="${MVN_ARGS:-} -s /run/secrets/maven_settings -Dmaven.repo.local=/home/cyclonedx/.m2"; ' : 'export MVN_ARGS="${MVN_ARGS:-} -Dmaven.repo.local=/home/cyclonedx/.m2"; '
 
     def stages = entries.withIndex().collect { entry, index ->
         def stageName = "scan${index}"
         def projectContext = "project_${index}"
         def args = cdxgenArgs.collect { it.toString() }
-        def cdxgenCommand = "cdxgen -o /out/sbom.json ${args.join(' ')} ."
+        def cdxgenCommand = "cdxgen -o /tmp/out/sbom.json ${args.join(' ')} ."
         def cacheMounts = (entry.cacheMounts ?: []).collect { cacheMount ->
-            "--mount=type=cache,id=${cacheMount.id},target=${cacheMount.target},sharing=locked"
+            "--mount=type=cache,id=${cacheMount.id},target=${cacheMount.target},uid=1000,gid=1000,sharing=locked"
         }.join(" ")
         def runMounts = [cacheMounts, secretMounts].findAll { it }.join(" ")
         return """FROM ${cacheContext.scannerImage} AS ${stageName}
 WORKDIR /workspace
 COPY --from=${projectContext} / /workspace/
-RUN ${runMounts ? runMounts + " " : ""}${envParamsExport}${settingsExport}mkdir -p /out && ${cdxgenCommand}
+RUN ${runMounts ? runMounts + " " : ""}${envParamsExport}${settingsExport}mkdir -p /tmp/out && ${cdxgenCommand}
 """
     }.join("\n")
     def exports = entries.withIndex().collect { entry, index ->
-        "COPY --from=scan${index} /out/sbom.json /${entry.keyInfo.projectId}/sbom.json"
+        "COPY --from=scan${index} /tmp/out/sbom.json /${entry.keyInfo.projectId}/sbom.json"
     }.join("\n")
     def dockerfile = """# syntax=docker/dockerfile:1.7
 ${stages}
