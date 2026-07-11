@@ -54,6 +54,23 @@ docker:
   additional_registries:
     - "https://index.docker.io/v1/"
 
+extensions:
+  - name: testSBOM
+    repo: ssh://git@github.com/ObraztsovOleg/demo.config.git
+    branch: master
+    script_path: generateSBOMCyclonedx.groovy
+    stage: prepare
+    phase: after
+    cdxgen: cdxgen-12.6.0
+    cdxgen_path: cdxgen
+    cyclonedx_cli: cyclonedx-cli-0.32.0
+    cyclonedx_cli_path: cyclonedx
+    cache:
+      scanned_image_cache: docker.io/k32nc23423/sbom-cache:local
+      scanner_image: ghcr.io/cyclonedx/cdxgen:v12
+      builder: buildx
+    args:
+      - "--fail-on-error"
 
 disabled_extensions:
   - "makeReleaseNotes"
