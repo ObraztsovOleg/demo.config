@@ -69,8 +69,12 @@ extensions:
       creds: deploy-docker
       scanned_image_cache: docker.io/k32nc23423/sbom-cache:local
       scanner_image: ghcr.io/cyclonedx/cdxgen:v12
+      dockerfile_frontend: docker/dockerfile:1.7-labs
       builder: buildx
+      export_mode: min
     args:
+      - "-t"
+      - "java"
       - "--fail-on-error"
 
 disabled_extensions:

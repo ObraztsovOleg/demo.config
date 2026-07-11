@@ -28,7 +28,13 @@ def wrapMaven(def config, extension, def closure) {
     def mavenLocalRepo = extension.maven?.local_repo ?: '$workspace/.m2'
     if (config.maven) {
         result = {
-            withMaven(maven: mavenHome, jdk: jdk, mavenSettingsConfig: mavenSettingsConfig, mavenLocalRepo: mavenLocalRepo) {
+            withMaven(
+                maven: mavenHome,
+                jdk: jdk,
+                mavenSettingsConfig: mavenSettingsConfig,
+                mavenLocalRepo: mavenLocalRepo,
+                publisherStrategy: 'EXPLICIT'
+            ) {
                 closure()
             }
         }
@@ -247,7 +253,8 @@ def getTools(def extension) {
     def tools = [
         "CYCLONE=${tool name: extension.cdxgen ?: 'cdxgen-12.6.0'}",
         "CYClONE_CLI=${tool name: extension.cyclonedx_cli ?: 'cyclonedx-linux-x64-v0.27.1'}",
-        "MVN_ARGS=${env.MVN_ARGS ?: '-DincludeProvidedScope=false'}",
+        "MVN_ARGS=${env.MVN_ARGS ?: '-DincludeProvidedScope=false -Djacoco.skip=true'}",
+        "PREFER_MAVEN_DEPS_TREE=${env.PREFER_MAVEN_DEPS_TREE ?: 'false'}",
         "CDX_MAVEN_INCLUDE_TEST_SCOPE=${env.CDX_MAVEN_INCLUDE_TEST_SCOPE ?: false}",
         "NODE_EXTRA_CA_CERTS=${env.NODE_EXTRA_CA_CERTS ?: env.TRUSTED_CERT_CHAIN_PATH ?: ''}"
     ]
@@ -328,8 +335,7 @@ def findMavenProjectDirs(def sourceDirs, def excludedDirs = []) {
             script: """
                 set -e
                 cd "${sourceDir}"
-                find . \\( -path './target' -o -path './target/*' -o -path './build' -o -path './build/*' \\) -prune -o \\
-                    -name 'pom.xml' -type f -print
+                find . -name 'pom.xml' -type f -print
             """,
             returnStdout: true
         ).tokenize("\n").collect { relativePath ->
@@ -354,13 +360,13 @@ def findMavenProjectDirs(def sourceDirs, def excludedDirs = []) {
         modules.each { moduleValue ->
             def moduleName = moduleValue.toString().trim()
             if (moduleName) {
-                def moduleDir = getCommandOutput(script: """
+                def moduleDir = sh(script: """
                     cd "${projectDir}"
                     if [ -d "${moduleName}" ]; then
                         cd "${moduleName}"
                         pwd
                     fi
-                """)
+                """, returnStdout: true).trim()
                 if (moduleDir && pomByDir.containsKey(moduleDir)) {
                     moduleDirs << moduleDir
                 }
@@ -371,40 +377,66 @@ def findMavenProjectDirs(def sourceDirs, def excludedDirs = []) {
     return pomByDir.keySet().findAll { !moduleDirs.contains(it) }.sort()
 }
 
-def prepareDockerProjectEntries(def globals, def cacheContext, def sourceDirs, def excludedDirs, def defaultSbomName) {
-    def mavenContextRoot = "${cacheContext.dir}/maven-contexts"
-    def mavenProjectDirs = findMavenProjectDirs(sourceDirs, excludedDirs)
-
-    return mavenProjectDirs.withIndex().collect { projectDir, index ->
-        def projectId = makeProjectId(globals, projectDir, index)
-        def contextDir = "${mavenContextRoot}/${projectId}"
-        sh """
-            set -e
-            rm -rf "${contextDir}"
-            mkdir -p "${contextDir}"
-            cd "${projectDir}"
-
-            find . \\( -path './target' -o -path './target/*' -o -path './build' -o -path './build/*' \\) -prune -o \\
-                -name 'pom.xml' -type f -print | while IFS= read -r file_path; do
-                    dest="${contextDir}/\${file_path#./}"
-                    mkdir -p "\$(dirname "\$dest")"
-                    cp "\$file_path" "\$dest"
-                done
-
-            if [ -d .mvn ]; then
-                mkdir -p "${contextDir}/.mvn"
-                cp -R .mvn/. "${contextDir}/.mvn"/
-            fi
-        """
-        return [
-            type: "maven",
-            projectDir: projectDir,
-            contextDir: contextDir,
-            sbomPath: "${projectDir}/${defaultSbomName}",
-            keyInfo: [projectId: projectId],
-            cacheMounts: [[id: "sbom-maven-${projectId}", target: "/home/cyclonedx/.m2"]]
-        ]
+def prepareDockerProjectEntries(def globals, def cacheContext, def sourceDirs, def excludedDirs, def cdxgenArgs) {
+    def argLine = normalizeList(cdxgenArgs).join(" ")
+    def scanJava = argLine.contains("-t java") || argLine.contains("--type java") || argLine.contains("--type=java")
+    def scanJar = argLine.contains("-t jar") || argLine.contains("--type jar") || argLine.contains("--type=jar")
+    if (!scanJava && !scanJar) {
+        echo("SBOM Docker scan: в args не указан -t java/--type java или -t jar/--type jar. Docker scan пропущен.")
+        return []
     }
+
+    def cleanedArgs = []
+    def tokens = normalizeList(cdxgenArgs)
+    for (int index = 0; index < tokens.size(); index++) {
+        def token = tokens[index].toString()
+        if (token == "-t" || token == "--type") {
+            index++
+        } else if (token.startsWith("--type=")) {
+            continue
+        } else {
+            cleanedArgs << tokens[index]
+        }
+    }
+
+    def entries = []
+
+    if (scanJava) {
+        def mavenProjectDirs = findMavenProjectDirs(sourceDirs, excludedDirs)
+        entries += mavenProjectDirs.withIndex().collect { projectDir, index ->
+            def projectId = makeProjectId(globals, projectDir, index)
+            def scanId = "${projectId}_java"
+            return [
+                type: "java",
+                projectDir: projectDir,
+                contextDir: projectDir,
+                sbomPath: "${cacheContext.dir}/${scanId}.json",
+                keyInfo: [projectId: scanId],
+                cdxgenArgs: cleanedArgs + ["-t", "java"],
+                copyPattern: "./**/pom.xml",
+                cacheMounts: [[id: "sbom-maven-${projectId}", target: "/home/cyclonedx/.m2"]]
+            ]
+        }
+    }
+
+    if (scanJar) {
+        entries += sourceDirs.findAll { !isExcludedDir(it, excludedDirs) }.withIndex().collect { projectDir, index ->
+            def projectId = makeProjectId(globals, projectDir, index)
+            def scanId = "${projectId}_jar"
+            return [
+                type: "jar",
+                projectDir: projectDir,
+                contextDir: projectDir,
+                sbomPath: "${cacheContext.dir}/${scanId}.json",
+                keyInfo: [projectId: scanId],
+                cdxgenArgs: cleanedArgs + ["-t", "jar"],
+                copyPattern: "./**/*.?ar",
+                cacheMounts: []
+            ]
+        }
+    }
+
+    return entries
 }
 
 def findSbomMergePaths(def extension, def defaultSbomName, def globals) {
@@ -462,14 +494,21 @@ def normalizeCacheConfig(def extension) {
     def scannedImageCache = cache.scanned_image_cache?.toString()?.trim()
     def cacheCreds = cache.creds?.toString()?.trim()
     def cacheRegistry = scannedImageCache?.tokenize('/')?.first()
-    def scannerImage = "ghcr.io/cyclonedx/cdxgen:v12"
-    scannerImage = cache.scanner_image?.toString()?.trim() ?: cache.scanner?.toString()?.trim() ?: scannerImage
+    def scannerImage = cache.scanner_image?.toString()?.trim() ?: "ghcr.io/cyclonedx/cdxgen:v12"
+    def dockerfileFrontend = cache.dockerfile_frontend?.toString()?.trim() ?: "docker/dockerfile:1.7-labs"
     def builder = cache.builder?.toString()?.trim() ?: "buildx"
+    def cacheExportMode = cache.export_mode?.toString()?.trim() ?: "min"
 
     builder = builder.toLowerCase()
     if (!(builder in ["buildx", "buildctl"])) {
         unstable("Параметр cache.builder=${builder} не поддерживается. Будет использован buildx.")
         builder = "buildx"
+    }
+
+    cacheExportMode = cacheExportMode.toLowerCase()
+    if (!(cacheExportMode in ["min", "max"])) {
+        unstable("Параметр cache.export_mode=${cacheExportMode} не поддерживается. Будет использован min.")
+        cacheExportMode = "min"
     }
 
     if (!scannedImageCache) {
@@ -484,7 +523,9 @@ def normalizeCacheConfig(def extension) {
         registry: cacheRegistry,
         creds: cacheCreds,
         scannerImage: scannerImage,
-        builder: builder
+        dockerfileFrontend: dockerfileFrontend,
+        builder: builder,
+        cacheExportMode: cacheExportMode
     ]
 }
 
@@ -530,7 +571,9 @@ def prepareDockerBuildContext(def cacheConfig, def globals) {
             registryRef: cacheConfig.registryRef,
             dockerConfigDir: dockerConfigDir,
             scannerImage: cacheConfig.scannerImage,
-            builder: "buildctl"
+            dockerfileFrontend: cacheConfig.dockerfileFrontend,
+            builder: "buildctl",
+            cacheExportMode: cacheConfig.cacheExportMode
         ]
     }
 
@@ -559,9 +602,11 @@ def prepareDockerBuildContext(def cacheConfig, def globals) {
         registryRef: cacheConfig.registryRef,
         dockerConfigDir: dockerConfigDir,
         scannerImage: cacheConfig.scannerImage,
+        dockerfileFrontend: cacheConfig.dockerfileFrontend,
         builder: "buildx",
         builderName: builderName,
-        buildkitConfigPath: buildkitConfigPath
+        buildkitConfigPath: buildkitConfigPath,
+        cacheExportMode: cacheConfig.cacheExportMode
     ]
 }
 
@@ -579,16 +624,11 @@ def createCacheContext(def extension, def globals) {
     }
 }
 
-def getCommandOutput(def args) {
-    def script = args instanceof Map ? args.script : args
-    return sh(script: script, returnStdout: true).trim()
-}
-
 def getCdxgenVersion(def cdxgenPath) {
-    return getCommandOutput(script: """
+    return sh(script: """
         set +e
         \${CYCLONE}/${cdxgenPath} --version 2>&1 || true
-    """)
+    """, returnStdout: true).trim()
 }
 
 def makeProjectId(def globals, def projectDir, def index = 0) {
@@ -631,7 +671,7 @@ void runDockerBatchWithBuildx(def cacheContext, def dockerfilePath, def outputDi
     ]).findAll { it }.join(" ")
 
     def cacheFromArg = cacheContext.registryRef ? "--cache-from \"type=registry,ref=${cacheContext.registryRef}\"" : ""
-    def cacheToArg = cacheContext.registryRef ? "--cache-to \"type=registry,ref=${cacheContext.registryRef},mode=max,ignore-error=true\"" : ""
+    def cacheToArg = cacheContext.registryRef ? "--cache-to \"type=registry,ref=${cacheContext.registryRef},mode=${cacheContext.cacheExportMode},ignore-error=true\"" : ""
     def dockerConfigArg = cacheContext.dockerConfigDir ? "--config \"${cacheContext.dockerConfigDir}\"" : ""
 
     sh """
@@ -667,7 +707,7 @@ void runDockerBatchWithBuildctl(def cacheContext, def dockerfilePath, def output
     ].findAll { it }.join(" ")
 
     def cacheFromArg = cacheContext.registryRef ? "--import-cache \"type=registry,ref=${cacheContext.registryRef}\"" : ""
-    def cacheToArg = cacheContext.registryRef ? "--export-cache \"type=registry,ref=${cacheContext.registryRef},mode=max,ignore-error=true\"" : ""
+    def cacheToArg = cacheContext.registryRef ? "--export-cache \"type=registry,ref=${cacheContext.registryRef},mode=${cacheContext.cacheExportMode},ignore-error=true\"" : ""
     def dockerConfigEnv = cacheContext.dockerConfigDir ? "DOCKER_CONFIG=\"${cacheContext.dockerConfigDir}\"" : ""
 
     sh """
@@ -692,22 +732,25 @@ def runCdxgenWithDockerCacheBatch(def cacheContext, def entries, def cdxgenArgs,
     def stages = entries.withIndex().collect { entry, index ->
         def stageName = "scan${index}"
         def projectContext = "project_${index}"
-        def args = cdxgenArgs.collect { it.toString() }
+        def args = (entry.cdxgenArgs ?: cdxgenArgs).collect { it.toString() }
         def cdxgenCommand = "cdxgen -o /tmp/out/sbom.json ${args.join(' ')} ."
+        def copyCommand = entry.copyPattern ?
+            "COPY --parents --from=${projectContext} ${entry.copyPattern} /workspace/" :
+            "COPY --from=${projectContext} / /workspace/"
         def cacheMounts = (entry.cacheMounts ?: []).collect { cacheMount ->
             "--mount=type=cache,id=${cacheMount.id},target=${cacheMount.target},uid=1000,gid=1000,sharing=locked"
         }.join(" ")
         def runMounts = [cacheMounts, secretMounts].findAll { it }.join(" ")
         return """FROM ${cacheContext.scannerImage} AS ${stageName}
 WORKDIR /workspace
-COPY --from=${projectContext} / /workspace/
+${copyCommand}
 RUN ${runMounts ? runMounts + " " : ""}${envParamsExport}${settingsExport}mkdir -p /tmp/out && ${cdxgenCommand}
 """
     }.join("\n")
     def exports = entries.withIndex().collect { entry, index ->
         "COPY --from=scan${index} /tmp/out/sbom.json /${entry.keyInfo.projectId}/sbom.json"
     }.join("\n")
-    def dockerfile = """# syntax=docker/dockerfile:1.7
+    def dockerfile = """# syntax=${cacheContext.dockerfileFrontend}
 ${stages}
 FROM scratch AS export
 ${exports}
@@ -796,7 +839,7 @@ void run(def extension, def extensionAPI) {
             def hostCdxgenArgs = cdxgenArgs
 
             if (cacheContext) {
-                dockerProjectEntries = prepareDockerProjectEntries(globals, cacheContext, sourceDirs, excludedDirs, defaultSbomName)
+                dockerProjectEntries = prepareDockerProjectEntries(globals, cacheContext, sourceDirs, excludedDirs, cdxgenArgs)
                 dockerProjectDirs = dockerProjectEntries.collect { it.projectDir }
                 hostExcludedDirs = excludedDirs + dockerProjectDirs
 
