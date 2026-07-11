@@ -514,6 +514,7 @@ def prepareDockerBuildContext(def cacheConfig, def globals) {
         mkdir -p "${cacheDir}"
     """
     def dockerConfigDir = prepareDockerCacheConfig(cacheConfig, cacheDir)
+    def dockerConfigArg = dockerConfigDir ? "--config \"${dockerConfigDir}\"" : ""
 
     if (cacheConfig.builder == "buildctl") {
         sh """
@@ -535,7 +536,7 @@ def prepareDockerBuildContext(def cacheConfig, def globals) {
 
     sh """
         set -e
-        docker buildx version >/dev/null
+        docker ${dockerConfigArg} buildx version >/dev/null
     """
 
     writeFile file: buildkitConfigPath, text: """[worker.oci]
@@ -544,11 +545,11 @@ def prepareDockerBuildContext(def cacheConfig, def globals) {
 
     sh """
         set -e
-        docker buildx create \
+        docker ${dockerConfigArg} buildx create \
             --name "${builderName}" \
             --driver docker-container \
             --config "${buildkitConfigPath}" >/dev/null
-        docker buildx inspect "${builderName}" --bootstrap >/dev/null
+        docker ${dockerConfigArg} buildx inspect "${builderName}" --bootstrap >/dev/null
     """
 
     echo("SBOM Docker build подготовлен: registry cache ${cacheConfig.registryRef}, scanner image ${cacheConfig.scannerImage}, builder ${builderName}")
