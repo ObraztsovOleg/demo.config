@@ -631,7 +631,7 @@ void runDockerBatchWithBuildx(def cacheContext, def dockerfilePath, def outputDi
     ]).findAll { it }.join(" ")
 
     def cacheFromArg = cacheContext.registryRef ? "--cache-from \"type=registry,ref=${cacheContext.registryRef}\"" : ""
-    def cacheToArg = cacheContext.registryRef ? "--cache-to \"type=registry,ref=${cacheContext.registryRef},mode=max\"" : ""
+    def cacheToArg = cacheContext.registryRef ? "--cache-to \"type=registry,ref=${cacheContext.registryRef},mode=max,ignore-error=true\"" : ""
     def dockerConfigArg = cacheContext.dockerConfigDir ? "--config \"${cacheContext.dockerConfigDir}\"" : ""
 
     sh """
@@ -667,7 +667,7 @@ void runDockerBatchWithBuildctl(def cacheContext, def dockerfilePath, def output
     ].findAll { it }.join(" ")
 
     def cacheFromArg = cacheContext.registryRef ? "--import-cache \"type=registry,ref=${cacheContext.registryRef}\"" : ""
-    def cacheToArg = cacheContext.registryRef ? "--export-cache \"type=registry,ref=${cacheContext.registryRef},mode=max\"" : ""
+    def cacheToArg = cacheContext.registryRef ? "--export-cache \"type=registry,ref=${cacheContext.registryRef},mode=max,ignore-error=true\"" : ""
     def dockerConfigEnv = cacheContext.dockerConfigDir ? "DOCKER_CONFIG=\"${cacheContext.dockerConfigDir}\"" : ""
 
     sh """
