@@ -323,14 +323,20 @@ def findMavenProjectDirs(def sourceDirs, def excludedDirs = []) {
     def activeSourceDirs = sourceDirs.findAll { !isExcludedDir(it, excludedDirs) }
     if (!activeSourceDirs) return []
 
-    def prune = findPruneExpression(excludedDirs)
-    def findDirs = activeSourceDirs.collect { "\"${it}\"" }.join(" ")
-    def pomPaths = sh(
-        script: "find ${findDirs} ${prune} " +
-            "\\( -path '*/target' -o -path '*/target/*' -o -path '*/build' -o -path '*/build/*' \\) -prune -o " +
-            "-name 'pom.xml' -type f -print",
-        returnStdout: true
-    ).tokenize("\n").sort()
+    def pomPaths = activeSourceDirs.collectMany { sourceDir ->
+        sh(
+            script: """
+                set -e
+                cd "${sourceDir}"
+                find . \\( -path './target' -o -path './target/*' -o -path './build' -o -path './build/*' \\) -prune -o \\
+                    -name 'pom.xml' -type f -print
+            """,
+            returnStdout: true
+        ).tokenize("\n").collect { relativePath ->
+            def normalizedRelativePath = relativePath.startsWith("./") ? relativePath.substring(2) : relativePath
+            "${sourceDir}/${normalizedRelativePath}"
+        }
+    }.sort()
 
     def pomByDir = pomPaths.collectEntries { path ->
         [(path.substring(0, path.length() - "/pom.xml".length())): path]
