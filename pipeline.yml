@@ -59,7 +59,7 @@ extensions:
     repo: ssh://git@github.com/ObraztsovOleg/demo.config.git
     branch: master
     script_path: generateSBOMCyclonedx.groovy
-    stage: prepare
+    stage: build
     phase: after
     cdxgen: cdxgen-12.6.0
     cdxgen_path: cdxgen
