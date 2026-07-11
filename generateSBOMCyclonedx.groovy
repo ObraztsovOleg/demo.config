@@ -460,6 +460,8 @@ def normalizeCacheConfig(def extension) {
     }
 
     def scannedImageCache = cache.scanned_image_cache?.toString()?.trim()
+    def cacheCreds = cache.creds?.toString()?.trim()
+    def cacheRegistry = scannedImageCache?.tokenize('/')?.first()
     def scannerImage = "ghcr.io/cyclonedx/cdxgen:v12"
     scannerImage = cache.scanner_image?.toString()?.trim() ?: cache.scanner?.toString()?.trim() ?: scannerImage
     def builder = cache.builder?.toString()?.trim() ?: "buildx"
@@ -479,9 +481,26 @@ def normalizeCacheConfig(def extension) {
     return [
         backend: "docker",
         registryRef: scannedImageCache,
+        registry: cacheRegistry,
+        creds: cacheCreds,
         scannerImage: scannerImage,
         builder: builder
     ]
+}
+
+def prepareDockerCacheConfig(def cacheConfig, def cacheDir) {
+    if (!cacheConfig.creds) return null
+
+    def configDir = "${cacheDir}/docker-config"
+    def object = [auths: [:]]
+
+    withCredentials([usernameColonPassword(credentialsId: cacheConfig.creds, variable: "BASIC_AUTH")]) {
+        def token = sh(script: "echo -n \"\$BASIC_AUTH\" | base64 | tr -d '\n'", returnStdout: true)
+        object.auths[cacheConfig.registry] = [auth: token]
+    }
+
+    dir(configDir) { writeJSON file: "config.json", json: object }
+    return configDir
 }
 
 def prepareDockerBuildContext(def cacheConfig, def globals) {
@@ -494,6 +513,7 @@ def prepareDockerBuildContext(def cacheConfig, def globals) {
         rm -rf "${cacheDir}"
         mkdir -p "${cacheDir}"
     """
+    def dockerConfigDir = prepareDockerCacheConfig(cacheConfig, cacheDir)
 
     if (cacheConfig.builder == "buildctl") {
         sh """
@@ -507,6 +527,7 @@ def prepareDockerBuildContext(def cacheConfig, def globals) {
             backend: "docker",
             dir: cacheDir,
             registryRef: cacheConfig.registryRef,
+            dockerConfigDir: dockerConfigDir,
             scannerImage: cacheConfig.scannerImage,
             builder: "buildctl"
         ]
@@ -535,6 +556,7 @@ def prepareDockerBuildContext(def cacheConfig, def globals) {
         backend: "docker",
         dir: cacheDir,
         registryRef: cacheConfig.registryRef,
+        dockerConfigDir: dockerConfigDir,
         scannerImage: cacheConfig.scannerImage,
         builder: "buildx",
         builderName: builderName,
@@ -609,10 +631,11 @@ void runDockerBatchWithBuildx(def cacheContext, def dockerfilePath, def outputDi
 
     def cacheFromArg = cacheContext.registryRef ? "--cache-from \"type=registry,ref=${cacheContext.registryRef}\"" : ""
     def cacheToArg = cacheContext.registryRef ? "--cache-to \"type=registry,ref=${cacheContext.registryRef},mode=max\"" : ""
+    def dockerConfigArg = cacheContext.dockerConfigDir ? "--config \"${cacheContext.dockerConfigDir}\"" : ""
 
     sh """
         set -e
-        docker buildx build ${cacheFromArg} ${cacheToArg} ${baseArgs}
+        docker ${dockerConfigArg} buildx build ${cacheFromArg} ${cacheToArg} ${baseArgs}
     """
 }
 
@@ -644,10 +667,11 @@ void runDockerBatchWithBuildctl(def cacheContext, def dockerfilePath, def output
 
     def cacheFromArg = cacheContext.registryRef ? "--import-cache \"type=registry,ref=${cacheContext.registryRef}\"" : ""
     def cacheToArg = cacheContext.registryRef ? "--export-cache \"type=registry,ref=${cacheContext.registryRef},mode=max\"" : ""
+    def dockerConfigEnv = cacheContext.dockerConfigDir ? "DOCKER_CONFIG=\"${cacheContext.dockerConfigDir}\"" : ""
 
     sh """
         set -e
-        buildctl build ${cacheFromArg} ${cacheToArg} ${baseArgs}
+        ${dockerConfigEnv} buildctl build ${cacheFromArg} ${cacheToArg} ${baseArgs}
     """
 }
 

@@ -66,6 +66,7 @@ extensions:
     cyclonedx_cli: cyclonedx-cli-0.32.0
     cyclonedx_cli_path: cyclonedx
     cache:
+      creds: deploy-creds
       scanned_image_cache: docker.io/k32nc23423/sbom-cache:local
       scanner_image: ghcr.io/cyclonedx/cdxgen:v12
       builder: buildx
