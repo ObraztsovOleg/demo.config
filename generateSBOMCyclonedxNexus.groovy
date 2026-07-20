@@ -737,8 +737,12 @@ def runCacheGet(def cacheContext, def url, def outputPath) {
     }
 
     def response = null
-    withCredentials([usernameColonPassword(credentialsId: cacheContext.creds, variable: "SBOM_CACHE_AUTH")]) {
-        response = sh(script: curlScript('-u "$SBOM_CACHE_AUTH"'), returnStdout: true)
+    withCredentials([usernamePassword(
+        credentialsId: cacheContext.creds,
+        usernameVariable: "SBOM_CACHE_USERNAME",
+        passwordVariable: "SBOM_CACHE_PASSWORD"
+    )]) {
+        response = sh(script: curlScript('-u "$SBOM_CACHE_USERNAME:$SBOM_CACHE_PASSWORD"'), returnStdout: true)
     }
     return response?.trim()
 }
@@ -758,8 +762,12 @@ def runCachePut(def cacheContext, def url, def sourcePath, def outputPath) {
     }
 
     def response = null
-    withCredentials([usernameColonPassword(credentialsId: cacheContext.creds, variable: "SBOM_CACHE_AUTH")]) {
-        response = sh(script: curlScript('-u "$SBOM_CACHE_AUTH"'), returnStdout: true)
+    withCredentials([usernamePassword(
+        credentialsId: cacheContext.creds,
+        usernameVariable: "SBOM_CACHE_USERNAME",
+        passwordVariable: "SBOM_CACHE_PASSWORD"
+    )]) {
+        response = sh(script: curlScript('-u "$SBOM_CACHE_USERNAME:$SBOM_CACHE_PASSWORD"'), returnStdout: true)
     }
     return response?.trim()
 }
