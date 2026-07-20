@@ -725,9 +725,11 @@ def prepareCacheContext(def globals, def cacheConfig) {
 def withCacheCredentials(def cacheConfig, def closure) {
     if (!cacheConfig?.creds) return closure()
 
+    def result = null
     withCredentials([usernameColonPassword(credentialsId: cacheConfig.creds, variable: "SBOM_CACHE_AUTH")]) {
-        closure()
+        result = closure()
     }
+    return result
 }
 
 def cacheCurlAuthArg(def cacheConfig) {
@@ -763,7 +765,14 @@ def runCachePut(def cacheContext, def url, def sourcePath, def outputPath) {
 }
 
 def parseCacheResponse(def text) {
-    def parts = text.tokenize(":")
+    if (!text) {
+        return [
+            curlStatus: 1,
+            httpCode: 0
+        ]
+    }
+
+    def parts = text.toString().trim().tokenize(":")
     return [
         curlStatus: parts ? parts.first().toInteger() : 1,
         httpCode: parts.size() > 1 ? parts.last().toInteger() : 0
