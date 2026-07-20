@@ -722,46 +722,46 @@ def prepareCacheContext(def globals, def cacheConfig) {
     return cacheConfig + [dir: cacheDir]
 }
 
-def withCacheCredentials(def cacheConfig, def closure) {
-    if (!cacheConfig?.creds) return closure()
-
-    def result = null
-    withCredentials([usernameColonPassword(credentialsId: cacheConfig.creds, variable: "SBOM_CACHE_AUTH")]) {
-        result = closure()
-    }
-    return result
-}
-
-def cacheCurlAuthArg(def cacheConfig) {
-    return cacheConfig?.creds ? '-u "$SBOM_CACHE_AUTH"' : ''
-}
-
 def runCacheGet(def cacheContext, def url, def outputPath) {
-    return withCacheCredentials(cacheContext) {
-        sh(
-            script: """
-                set +e
-                http_code=\$(curl -k -sS ${cacheCurlAuthArg(cacheContext)} -w "%{http_code}" -o "${outputPath}" "${url}" 2>"${outputPath}.err")
-                curl_status=\$?
-                echo "\${curl_status}:\${http_code}"
-            """,
-            returnStdout: true
-        ).trim()
+    def curlScript = { authArg ->
+        return """
+            set +e
+            http_code=\$(curl -k -sS ${authArg} -w "%{http_code}" -o "${outputPath}" "${url}" 2>"${outputPath}.err")
+            curl_status=\$?
+            echo "\${curl_status}:\${http_code}"
+        """
     }
+
+    if (!cacheContext?.creds) {
+        return sh(script: curlScript(""), returnStdout: true)?.trim()
+    }
+
+    def response = null
+    withCredentials([usernameColonPassword(credentialsId: cacheContext.creds, variable: "SBOM_CACHE_AUTH")]) {
+        response = sh(script: curlScript('-u "$SBOM_CACHE_AUTH"'), returnStdout: true)
+    }
+    return response?.trim()
 }
 
 def runCachePut(def cacheContext, def url, def sourcePath, def outputPath) {
-    return withCacheCredentials(cacheContext) {
-        sh(
-            script: """
-                set +e
-                http_code=\$(curl -k -sS ${cacheCurlAuthArg(cacheContext)} -X PUT --data-binary @"${sourcePath}" -w "%{http_code}" -o "${outputPath}" "${url}" 2>"${outputPath}.err")
-                curl_status=\$?
-                echo "\${curl_status}:\${http_code}"
-            """,
-            returnStdout: true
-        ).trim()
+    def curlScript = { authArg ->
+        return """
+            set +e
+            http_code=\$(curl -k -sS ${authArg} -X PUT --data-binary @"${sourcePath}" -w "%{http_code}" -o "${outputPath}" "${url}" 2>"${outputPath}.err")
+            curl_status=\$?
+            echo "\${curl_status}:\${http_code}"
+        """
     }
+
+    if (!cacheContext?.creds) {
+        return sh(script: curlScript(""), returnStdout: true)?.trim()
+    }
+
+    def response = null
+    withCredentials([usernameColonPassword(credentialsId: cacheContext.creds, variable: "SBOM_CACHE_AUTH")]) {
+        response = sh(script: curlScript('-u "$SBOM_CACHE_AUTH"'), returnStdout: true)
+    }
+    return response?.trim()
 }
 
 def parseCacheResponse(def text) {
