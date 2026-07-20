@@ -711,7 +711,7 @@ def prepareCacheKey(def entry, def cdxgenVersion, def mavenSettingsId) {
 
 def getCacheObjectUrl(def cacheConfig, def entry) {
     if (!cacheConfig || !entry.cacheKey) return null
-    return "${cacheConfig.url}/${cacheConfig.prefix}/${entry.projectId}/${entry.cacheKey}.json"
+    return "${cacheConfig.url}/${cacheConfig.prefix}/${entry.cacheKey}.json"
 }
 
 def prepareCacheContext(def globals, def cacheConfig) {
