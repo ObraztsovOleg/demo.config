@@ -66,20 +66,8 @@ extensions:
     cyclonedx_cli: cyclonedx-cli-0.32.0
     cyclonedx_cli_path: cyclonedx
     parallel: true
-    cache:
-      - type: git
-        repo: ssh://git@github.com/ObraztsovOleg/demo.config.git
-        branch: master
-      - type: container
-        creds: deploy-docker
-        scanned_image_cache: docker.io/k32nc23423/sbom-cache:local
-        scanner_image: ghcr.io/cyclonedx/cdxgen:v12
-        dockerfile_frontend: docker/dockerfile:1.7-labs
-        builder: buildx
-        export_mode: min
     args:
-      - "-t"
-      - "java"
+      - "-t java"
       - "--fail-on-error"
 
 disabled_extensions:
