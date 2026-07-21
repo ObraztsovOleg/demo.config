@@ -1489,72 +1489,72 @@ void convertSbomFile(def sbomPath, def specVersion, def cyclonedxCliPath) {
 
 void finalizeHierarchicalSbom(def sbomPath, def sbomTemplatePath) {
     def rootAliasesFilter = '''
-($root[0]) as $r
-| ($r["bom-ref"] | tostring) as $rootRef
-| [
-    $rootRef,
-    ($rootRef + ":" + $rootRef),
-    ((.components // [])[]?
-      | select(type == "object")
-      | (.["bom-ref"] // "" | tostring) as $componentRef
-      | (.purl // "" | tostring) as $purl
-      | ($r.purl // "" | tostring) as $rootPurl
-      | (.group // "" | tostring) as $group
-      | ($r.group // "" | tostring) as $rootGroup
-      | (.name // "" | tostring) as $name
-      | ($r.name // "" | tostring) as $rootName
-      | (.version // "" | tostring) as $version
-      | ($r.version // "" | tostring) as $rootVersion
-      | select(
-          $componentRef == $rootRef
-          or $componentRef == ($rootRef + ":" + $rootRef)
-          or ($purl != "" and $purl == $rootPurl)
-          or ($rootGroup != "" and $group == $rootGroup and $name == $rootName and $version == $rootVersion)
-        )
-      | $componentRef
-    )
-  ]
-| map(select(. != ""))
-| unique
-''';
+        ($root[0]) as $r
+        | ($r["bom-ref"] | tostring) as $rootRef
+        | [
+            $rootRef,
+            ($rootRef + ":" + $rootRef),
+            ((.components // [])[]?
+              | select(type == "object")
+              | (.["bom-ref"] // "" | tostring) as $componentRef
+              | (.purl // "" | tostring) as $purl
+              | ($r.purl // "" | tostring) as $rootPurl
+              | (.group // "" | tostring) as $group
+              | ($r.group // "" | tostring) as $rootGroup
+              | (.name // "" | tostring) as $name
+              | ($r.name // "" | tostring) as $rootName
+              | (.version // "" | tostring) as $version
+              | ($r.version // "" | tostring) as $rootVersion
+              | select(
+                  $componentRef == $rootRef
+                  or $componentRef == ($rootRef + ":" + $rootRef)
+                  or ($purl != "" and $purl == $rootPurl)
+                  or ($rootGroup != "" and $group == $rootGroup and $name == $rootName and $version == $rootVersion)
+                )
+              | $componentRef
+            )
+          ]
+        | map(select(. != ""))
+        | unique
+    '''
     def replaceRootComponentFilter = '''
-($root[0]) as $r
-| ($rootRefs[0]) as $refs
-| .metadata = ((.metadata // {}) | if type == "object" then . else {} end)
-| .metadata.component = $r
-| .components = (
-    (.components // [])
-    | if type == "array" then . else [] end
-    | map(
-        if type == "object" then
-          (.["bom-ref"] // "" | tostring) as $ref
-          | select(($refs | index($ref)) == null)
-        else
-          .
-        end
-      )
-  )
-''';
+        ($root[0]) as $r
+        | ($rootRefs[0]) as $refs
+        | .metadata = ((.metadata // {}) | if type == "object" then . else {} end)
+        | .metadata.component = $r
+        | .components = (
+            (.components // [])
+            | if type == "array" then . else [] end
+            | map(
+                if type == "object" then
+                  (.["bom-ref"] // "" | tostring) as $ref
+                  | select(($refs | index($ref)) == null)
+                else
+                  .
+                end
+              )
+          )
+    '''
     def cleanupRootDependencyFilter = '''
-def as_array:
-  if . == null then []
-  elif type == "array" then .
-  else [.] end;
+        def as_array:
+          if . == null then []
+          elif type == "array" then .
+          else [.] end;
 
-($root[0]["bom-ref"] | tostring) as $rootRef
-| ($rootRefs[0]) as $refs
-| (.dependencies | as_array | map(select(type == "object"))) as $deps
-| [$deps[] | select((.ref // "" | tostring) == $rootRef)] as $rootDeps
-| ([$rootDeps[] | (.dependsOn | as_array)[]? | tostring | . as $ref | select(($refs | index($ref)) == null)] | unique) as $rootDependsOn
-| ([$rootDeps[] | (.provides | as_array)[]? | tostring | . as $ref | select(($refs | index($ref)) == null)] | unique) as $rootProvides
-| ({ref: $rootRef, dependsOn: $rootDependsOn} + if ($rootProvides | length) > 0 then {provides: $rootProvides} else {} end) as $rootDependency
-| .dependencies = (
-    [$rootDependency]
-    + [$deps[]
-       | (.ref // "" | tostring) as $ref
-       | select($ref != $rootRef and (($refs | index($ref)) == null))]
-  )
-''';
+        ($root[0]["bom-ref"] | tostring) as $rootRef
+        | ($rootRefs[0]) as $refs
+        | (.dependencies | as_array | map(select(type == "object"))) as $deps
+        | [$deps[] | select((.ref // "" | tostring) == $rootRef)] as $rootDeps
+        | ([$rootDeps[] | (.dependsOn | as_array)[]? | tostring | . as $ref | select(($refs | index($ref)) == null)] | unique) as $rootDependsOn
+        | ([$rootDeps[] | (.provides | as_array)[]? | tostring | . as $ref | select(($refs | index($ref)) == null)] | unique) as $rootProvides
+        | ({ref: $rootRef, dependsOn: $rootDependsOn} + if ($rootProvides | length) > 0 then {provides: $rootProvides} else {} end) as $rootDependency
+        | .dependencies = (
+            [$rootDependency]
+            + [$deps[]
+               | (.ref // "" | tostring) as $ref
+               | select($ref != $rootRef and (($refs | index($ref)) == null))]
+          )
+    '''
     def tmpPath = "${sbomPath}.finalized-${UUID.randomUUID().toString()}.tmp"
     def tmpNextPath = "${tmpPath}.next"
     def rootComponentPath = "${sbomPath}.root-component-${UUID.randomUUID().toString()}.tmp"
