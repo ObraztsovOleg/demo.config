@@ -1379,22 +1379,33 @@ def prepareHierarchicalMergeInputs(def inputFiles, def globals) {
     return result.unique()
 }
 
-void mergeHierarchicalSbomFiles(def inputFiles, def outputPath, def cyclonedxCliPath, def specVersion, def rootComponent) {
+void mergeHierarchicalSbomFiles(def inputFiles, def outputPath, def cyclonedxCliPath, def specVersion, def sbomTemplatePath) {
     // Создаем папку результата перед запуском CLI.
     ensureParentDirectory(outputPath)
 
     // Единственное место, где строится общая hierarchy между BOM:
     // template и каждый input BOM передаются в штатный cyclonedx-cli merge --hierarchical.
     sh """
+        command -v jq >/dev/null 2>&1 || { echo 'SBOM hierarchical merge requires jq'; exit 1; }
+
+        root_group=\$(jq -r '.metadata.component.group // ""' ${shellQuote(sbomTemplatePath)})
+        root_name=\$(jq -r '.metadata.component.name // ""' ${shellQuote(sbomTemplatePath)})
+        root_version=\$(jq -r '.metadata.component.version // ""' ${shellQuote(sbomTemplatePath)})
+
+        if [ -z "\$root_name" ] || [ -z "\$root_version" ]; then
+            echo "SBOM hierarchical merge: root metadata component is missing name/version in ${shellQuote(sbomTemplatePath)}"
+            exit 1
+        fi
+
         \${CYClONE_CLI}/${cyclonedxCliPath} merge \
             --input-files ${normalizeList(inputFiles).collect { shellQuote(it) }.join(' ')} \
             --output-file ${shellQuote(outputPath)} \
             --output-format json \
             --output-version ${specVersion} \
             --hierarchical \
-            --group ${shellQuote(rootComponent.group ?: '')} \
-            --name ${shellQuote(rootComponent.name)} \
-            --version ${shellQuote(rootComponent.version)}
+            --group "\$root_group" \
+            --name "\$root_name" \
+            --version "\$root_version"
     """
 }
 
@@ -1410,97 +1421,111 @@ void convertSbomFile(def sbomPath, def specVersion, def cyclonedxCliPath) {
 }
 
 void finalizeHierarchicalSbom(def sbomPath, def sbomTemplatePath) {
-    // Читаем результат cyclonedx-cli и исходный template с корневым компонентом приложения.
-    def bom = readJSON(file: sbomPath)
-    def templateBom = readJSON(file: sbomTemplatePath)
-    def rootComponent = templateBom.metadata?.component
-    def rootRef = rootComponent?."bom-ref"?.toString()?.trim()
+    def rootAliasesFilter = '''
+($root[0]) as $r
+| ($r["bom-ref"] | tostring) as $rootRef
+| [
+    $rootRef,
+    ($rootRef + ":" + $rootRef),
+    ((.components // [])[]?
+      | select(type == "object")
+      | (.["bom-ref"] // "" | tostring) as $componentRef
+      | (.purl // "" | tostring) as $purl
+      | ($r.purl // "" | tostring) as $rootPurl
+      | (.group // "" | tostring) as $group
+      | ($r.group // "" | tostring) as $rootGroup
+      | (.name // "" | tostring) as $name
+      | ($r.name // "" | tostring) as $rootName
+      | (.version // "" | tostring) as $version
+      | ($r.version // "" | tostring) as $rootVersion
+      | select(
+          $componentRef == $rootRef
+          or $componentRef == ($rootRef + ":" + $rootRef)
+          or ($purl != "" and $purl == $rootPurl)
+          or ($rootGroup != "" and $group == $rootGroup and $name == $rootName and $version == $rootVersion)
+        )
+      | $componentRef
+    )
+  ]
+| map(select(. != ""))
+| unique
+'''
+    def replaceRootComponentFilter = '''
+($root[0]) as $r
+| ($rootRefs[0]) as $refs
+| .metadata = ((.metadata // {}) | if type == "object" then . else {} end)
+| .metadata.component = $r
+| .components = (
+    (.components // [])
+    | if type == "array" then . else [] end
+    | map(
+        if type == "object" then
+          (.["bom-ref"] // "" | tostring) as $ref
+          | select(($refs | index($ref)) == null)
+        else
+          .
+        end
+      )
+  )
+'''
+    def cleanupRootDependencyFilter = '''
+def as_array:
+  if . == null then []
+  elif type == "array" then .
+  else [.] end;
 
-    // Без root из template нельзя безопасно понять, что именно надо считать верхом итогового SBOM.
-    if (!rootComponent || !rootRef) {
-        unstable("SBOM hierarchical finalize: root metadata component is missing in ${sbomTemplatePath}")
-        return
-    }
+($root[0]["bom-ref"] | tostring) as $rootRef
+| ($rootRefs[0]) as $refs
+| (.dependencies | as_array | map(select(type == "object"))) as $deps
+| [$deps[] | select((.ref // "" | tostring) == $rootRef)] as $rootDeps
+| ([$rootDeps[] | (.dependsOn | as_array)[]? | tostring | . as $ref | select(($refs | index($ref)) == null)] | unique) as $rootDependsOn
+| ([$rootDeps[] | (.provides | as_array)[]? | tostring | . as $ref | select(($refs | index($ref)) == null)] | unique) as $rootProvides
+| ({ref: $rootRef, dependsOn: $rootDependsOn} + if ($rootProvides | length) > 0 then {provides: $rootProvides} else {} end) as $rootDependency
+| .dependencies = (
+    [$rootDependency]
+    + [$deps[]
+       | (.ref // "" | tostring) as $ref
+       | select($ref != $rootRef and (($refs | index($ref)) == null))]
+  )
+'''
+    def tmpPath = "${sbomPath}.finalized-${UUID.randomUUID().toString()}.tmp"
+    def tmpNextPath = "${tmpPath}.next"
+    def rootComponentPath = "${sbomPath}.root-component-${UUID.randomUUID().toString()}.tmp"
+    def rootRefsPath = "${sbomPath}.root-refs-${UUID.randomUUID().toString()}.tmp"
 
-    // metadata.component итогового BOM должен быть ровно из generateSBOMTemplate.
-    // CLI может собрать похожий root сам, но template содержит нужные group/name/version/purl/type.
-    bom.metadata = bom.metadata instanceof Map ? bom.metadata : [:]
-    bom.metadata.component = rootComponent
+    // Финальный cleanup делаем через jq, чтобы Jenkins/Groovy не поднимал большой merged BOM в память.
+    // Каждый jq-фильтр делает один маленький шаг: достать root, заменить metadata/component, почистить root dependency.
+    sh """
+        set -e
+        command -v jq >/dev/null 2>&1 || { echo 'SBOM hierarchical finalize requires jq'; exit 1; }
 
-    // Когда template передан как input, cyclonedx-cli может создать техническую materialized ссылку root:root.
-    // Собираем все ref-алиасы root, чтобы удалить только self/root мусор.
-    def rootComponentRefs = [rootRef, "${rootRef}:${rootRef}"] as LinkedHashSet
+        tmp_file=${shellQuote(tmpPath)}
+        next_file=${shellQuote(tmpNextPath)}
+        root_component_file=${shellQuote(rootComponentPath)}
+        root_refs_file=${shellQuote(rootRefsPath)}
+        trap 'rm -f "\$tmp_file" "\$next_file" "\$root_component_file" "\$root_refs_file"' EXIT
 
-    // Убираем top-level component, который дублирует metadata.component.
-    // Все реальные project components, созданные из остальных input BOM, остаются нетронутыми.
-    bom.components = normalizeList(bom.components).findAll { component ->
-        if (!(component instanceof Map)) return true
+        jq -e '.metadata.component | select(type == "object" and (."bom-ref" // "" | tostring | length > 0))' \
+            ${shellQuote(sbomTemplatePath)} > "\$root_component_file"
 
-        // Сравниваем и по ref, и по identity, потому что CLI может префиксовать ref при hierarchical merge.
-        def componentRef = component["bom-ref"]?.toString()?.trim()
-        def sameRootIdentity = component.purl?.toString() == rootComponent.purl?.toString() ||
-            (
-                component.group?.toString() == rootComponent.group?.toString() &&
-                component.name?.toString() == rootComponent.name?.toString() &&
-                component.version?.toString() == rootComponent.version?.toString()
-            )
+        jq --slurpfile root "\$root_component_file" ${shellQuote(rootAliasesFilter)} \
+            ${shellQuote(sbomPath)} > "\$root_refs_file"
 
-        if (componentRef == rootRef || sameRootIdentity) {
-            // Запоминаем ref удаленного root-дубликата, чтобы убрать ссылки на него из root dependency.
-            if (componentRef) rootComponentRefs << componentRef
-            return false
-        }
+        jq --slurpfile root "\$root_component_file" --slurpfile rootRefs "\$root_refs_file" \
+            ${shellQuote(replaceRootComponentFilter)} ${shellQuote(sbomPath)} > "\$tmp_file"
 
-        return true
-    }
+        jq --slurpfile root "\$root_component_file" --slurpfile rootRefs "\$root_refs_file" \
+            ${shellQuote(cleanupRootDependencyFilter)} "\$tmp_file" > "\$next_file"
 
-    def rootDependsOn = new LinkedHashSet()
-    def rootProvides = new LinkedHashSet()
-    def otherDependencies = []
-    def foundRootDependency = false
+        mv "\$next_file" ${shellQuote(sbomPath)}
+        rm -f "\$tmp_file" "\$root_component_file" "\$root_refs_file"
 
-    // Не пересобираем dependency graph после CLI.
-    // Проходим по entries только чтобы схлопнуть root dependency и убрать root -> root.
-    normalizeList(bom.dependencies).findAll { it instanceof Map }.each { dependency ->
-        def ref = dependency.ref?.toString()?.trim()
-        if (ref == rootRef) {
-            foundRootDependency = true
-
-            // Из root.dependsOn убираем только ссылки на сам root/template aliases.
-            // Все остальные children root - это результат cyclonedx-cli --hierarchical.
-            dependencyRefList(dependency.dependsOn).findAll { !rootComponentRefs.contains(it) }.each { rootDependsOn << it }
-            dependencyRefList(dependency.provides).findAll { !rootComponentRefs.contains(it) }.each { rootProvides << it }
-        } else if (rootComponentRefs.contains(ref)) {
-            // Это dependency entry для materialized template component.
-            // Ее удаляем, потому что template уже представлен как bom.metadata.component.
-        } else {
-            // Остальные dependency entries оставляем ровно как выдал cyclonedx-cli.
-            otherDependencies << dependency
-        }
-    }
-
-    // Возвращаем root dependency первой записью, чтобы дерево начиналось с компонента из generateSBOMTemplate.
-    def rootDependency = [ref: rootRef, dependsOn: rootDependsOn.collect { it }]
-    if (rootProvides) {
-        rootDependency.provides = rootProvides.collect { it }
-    }
-
-    // Если CLI root не создал, все равно пишем пустой root dependency.
-    // Это явный leaf root для template-only merge.
-    bom.dependencies = (foundRootDependency || otherDependencies) ?
-        ([rootDependency] + otherDependencies) :
-        [rootDependency]
-
-    // Записываем только очищенный итоговый BOM; исходные input BOM остаются без изменений.
-    writeJSON file: sbomPath, json: bom
+        trap - EXIT
+    """
 }
 
 // hierarchical merge должен видеть template и каждый входной SBOM как отдельные subjects; graph строит cyclonedx-cli.
 void mergeSbomFiles(def inputFiles, def mergedPath, def specVersion, def cyclonedxCliPath, def globals, boolean parallelMergeEnabled, def sbomTemplatePath) {
-    // Root component берем из template, который создан generateSBOMTemplate.
-    def templateBom = readJSON(file: sbomTemplatePath)
-    def rootComponent = templateBom.metadata?.component
-
     // Все реальные входные BOM нормализуются до запуска CLI.
     def files = prepareHierarchicalMergeInputs(inputFiles, globals)
 
@@ -1510,7 +1535,7 @@ void mergeSbomFiles(def inputFiles, def mergedPath, def specVersion, def cyclone
     echo("SBOM MERGE hierarchical: files=${mergeFiles.size()}, parallel_merge=${parallelMergeEnabled}, output=${mergedPath}")
 
     // Общий graph строит cyclonedx-cli --hierarchical.
-    mergeHierarchicalSbomFiles(mergeFiles, mergedPath, cyclonedxCliPath, specVersion, rootComponent)
+    mergeHierarchicalSbomFiles(mergeFiles, mergedPath, cyclonedxCliPath, specVersion, sbomTemplatePath)
 
     // После CLI убираем только технические root-дубли и self-dependency.
     finalizeHierarchicalSbom(mergedPath, sbomTemplatePath)
