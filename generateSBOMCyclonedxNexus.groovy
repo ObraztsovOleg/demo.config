@@ -10,8 +10,9 @@ def getDefaultConfig() {
 // Приводит скалярное или списковое поле YAML к единому списку для дальнейшего объединения.
 def normalizeList(def value) {
     if (value == null) return []
-    if (value instanceof List) return value
     if (value instanceof String) return value.trim() ? [value.trim()] : []
+    if (value instanceof Collection) return value.collectMany { normalizeList(it) }
+    if (value.getClass().isArray()) return value.toList().collectMany { normalizeList(it) }
     return [value]
 }
 
