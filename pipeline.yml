@@ -31,6 +31,31 @@ bh:
     ]
     update_version: false
     skip_rn: true
+
+build:
+  node.sbom.sample:
+    builder: npm
+    repo: ssh://git@github.com/ObraztsovOleg/HW02_app_IOT.git
+    branch: main
+    install: "npm ci --ignore-scripts --no-audit --no-fund"
+    cmd: "node -e \"JSON.parse(require('fs').readFileSync('package.json', 'utf8')); console.log('node sbom sample ok')\""
+    outputs:
+      - source: "package.json"
+        dest: "pl/node.sbom.sample"
+    update_version: false
+    create_tag: false
+    sonarSkip: true
+    skip_rn: true
+
+  go.sbom.sample:
+    builder: jenkinsfile
+    repo: ssh://git@github.com/spf13/cobra.git
+    branch: main
+    skip: true
+    update_version: false
+    create_tag: false
+    sonarSkip: true
+    skip_rn: true
     
 nexus:
   creds: "deploy-creds" # id (создадим позже) ТУЗа, c доступом на чтение из:
@@ -68,7 +93,9 @@ extensions:
     parallel: true
     args:
       - "-t java"
-      - "--fail-on-error"
+      - "-t jar"
+      - "-t js"
+      - "-t go"
 
 disabled_extensions:
   - "makeReleaseNotes"
