@@ -1126,6 +1126,8 @@ def getServiceBomRef(def service, def seed, int index) {
 }
 
 void collectComponentBomRefs(def components, def refs) {
+    // Собираем bom-ref не только у верхних components, но и у вложенных components.
+    // Это нужно для CycloneDX BOM, где компоненты могут быть иерархическими сами по себе.
     normalizeList(components).findAll { it instanceof Map }.each { component ->
         def ref = component["bom-ref"]?.toString()?.trim()
         if (ref) refs << ref
@@ -1136,10 +1138,14 @@ void collectComponentBomRefs(def components, def refs) {
 def ensureInventoryBomRefs(def bom, def seed) {
     def directRefs = new LinkedHashSet()
 
+    // Перед merge у каждого component должен быть bom-ref.
+    // Если его нет, getComponentBomRef создаст стабильный synthetic ref.
     normalizeList(bom.components).findAll { it instanceof Map }.eachWithIndex { component, index ->
         def ref = getComponentBomRef(component, seed, index)
         if (ref) directRefs << ref
     }
+
+    // services тоже участвуют в dependency graph через bom-ref, поэтому нормализуем их так же.
     normalizeList(bom.services).findAll { it instanceof Map }.eachWithIndex { service, index ->
         def ref = getServiceBomRef(service, seed, index)
         if (ref) directRefs << ref
@@ -1150,6 +1156,8 @@ def ensureInventoryBomRefs(def bom, def seed) {
 
 def collectKnownBomRefs(def bom) {
     def refs = new LinkedHashSet()
+
+    // Это полный inventory входного BOM: все components + services, которые могут появиться в dependencies.
     collectComponentBomRefs(bom.components, refs)
     normalizeList(bom.services).findAll { it instanceof Map }.each { service ->
         def ref = service["bom-ref"]?.toString()?.trim()
@@ -1162,6 +1170,8 @@ def getSbomSubjectName(def sbomPath) {
     def path = sbomPath?.toString()
     if (!path) return "sbom"
 
+    // Для synthetic metadata.component используем имя папки, где лежит SBOM.
+    // Так root входного BOM получается человекочитаемым, но не влияет на package graph.
     def slashIndex = path.lastIndexOf("/")
     if (slashIndex > 0) {
         return getPathTail(path.substring(0, slashIndex)) ?: getPathTail(path) ?: "sbom"
@@ -1170,17 +1180,24 @@ def getSbomSubjectName(def sbomPath) {
 }
 
 def ensureMetadataComponentForHierarchicalMerge(def bom, def sbomPath, def directRefs) {
+    // cyclonedx-cli merge --hierarchical требует metadata.component у каждого input BOM.
+    // Поэтому сначала гарантируем, что metadata является объектом.
     bom.metadata = bom.metadata instanceof Map ? bom.metadata : [:]
+
+    // Если входной BOM уже описывает свой subject/root, сохраняем его и только дополняем пустые поля.
     def component = bom.metadata.component instanceof Map ? bom.metadata.component : null
 
     if (component) {
+        // bom-ref нужен CLI как ключ subject'а. Приоритет: существующий bom-ref -> purl -> synthetic ref.
         def ref = component["bom-ref"]?.toString()?.trim()
         if (!ref) ref = component.purl?.toString()?.trim()
         if (!ref) {
+            // synthetic ref строится от пути файла и inventory refs, чтобы одинаковый BOM получал одинаковый root ref.
             def seed = "${sbomPath}:${directRefs.join('|')}:${component.group}:${component.name}:${component.version}"
             ref = "generated-root-${sha256Text(seed).take(32)}"
         }
 
+        // Не перетираем существующие значения, а заполняем только то, без чего CLI может упасть или создать плохой subject.
         component["bom-ref"] = ref
         if (!component.type?.toString()?.trim()) component.type = "application"
         if (!component.name?.toString()?.trim()) component.name = getSbomSubjectName(sbomPath)
@@ -1189,8 +1206,11 @@ def ensureMetadataComponentForHierarchicalMerge(def bom, def sbomPath, def direc
         return ref
     }
 
+    // Если metadata.component нет и inventory пустой, такой BOM нечего подвешивать в hierarchy.
     if (!directRefs) return null
 
+    // Если metadata.component нет, но components/services есть, создаем synthetic subject входного BOM.
+    // Это не зависимость приложения, а технический root конкретного input BOM для hierarchical merge.
     def syntheticRef = "generated-root-${sha256Text("${sbomPath}:${directRefs.join('|')}").take(32)}"
     bom.metadata.component = [
         type: "application",
@@ -1206,23 +1226,32 @@ def getRootDependencyRefs(def bom, def rootRef, def directRefs) {
     def knownRefs = collectKnownBomRefs(bom)
     def childRefs = new LinkedHashSet()
 
+    // Запоминаем все refs, на которые кто-то уже ссылается как на child.
+    // Такие refs не должны становиться root-level dependency, если graph уже описан.
     dependencies.each { dependency ->
         dependencyRefList(dependency.dependsOn).each { childRef ->
             if (childRef != rootRef) childRefs << childRef
         }
     }
 
+    // Если у BOM нет root dependency, root candidates берем из dependency entries,
+    // которые есть в inventory и не являются child других entries.
     def graphRoots = dependencies.collect { dependency ->
         dependency.ref?.toString()?.trim()
     }.findAll { ref ->
         ref && ref != rootRef && knownRefs.contains(ref) && !childRefs.contains(ref)
     }.unique()
 
+    // Если graph roots найти нельзя, fallback - прямой inventory верхнего уровня.
+    // Это нужно для artifact-only или malformed BOM, где graph отсутствует.
     return graphRoots ?: normalizeList(directRefs).findAll { it != rootRef }.unique()
 }
 
 def collectReachableDependencyRefs(def dependencies, def rootRef) {
     def dependencyRefs = [:].withDefault { new LinkedHashSet() }
+
+    // Строим adjacency map: dependency.ref -> dependency.dependsOn.
+    // Здесь ничего не придумываем, только читаем то, что уже есть во входном graph.
     normalizeList(dependencies).findAll { it instanceof Map }.each { dependency ->
         def ref = dependency.ref?.toString()?.trim()
         if (ref) {
@@ -1235,10 +1264,12 @@ def collectReachableDependencyRefs(def dependencies, def rootRef) {
     def reachable = new LinkedHashSet()
     def queue = new ArrayDeque()
     if (rootRef) {
+        // Обход всегда начинается от subject/root текущего input BOM.
         reachable << rootRef
         queue.add(rootRef)
     }
 
+    // Обычный BFS по dependsOn, чтобы понять какие refs реально достижимы от root.
     while (!queue.isEmpty()) {
         def ref = queue.removeFirst()
         dependencyRefs[ref].each { childRef ->
@@ -1254,16 +1285,25 @@ def collectReachableDependencyRefs(def dependencies, def rootRef) {
 
 // Делает входной graph явным: не придумывает transitives, но не оставляет inventory refs оторванными от root.
 def ensureCompleteInputDependencyGraph(def bom, def rootRef, def directRefs) {
+    // Берем только валидные dependency objects из входного BOM.
     def dependencies = normalizeList(bom.dependencies).findAll { it instanceof Map }
+
+    // knownRefs - все refs, которые объявлены в components/services этого BOM.
     def knownRefs = collectKnownBomRefs(bom)
+
+    // rootDependency - запись dependencies для metadata.component текущего input BOM.
     def rootDependency = dependencies.find { it.ref?.toString()?.trim() == rootRef }
     def hasUsableRootDependency = dependencyRefList(rootDependency?.dependsOn)
 
+    // Если root dependency отсутствует, создаем ее.
+    // Это минимальная подготовка для hierarchical merge, а не построение package graph.
     if (!rootDependency) {
         rootDependency = [ref: rootRef, dependsOn: []]
         dependencies = [rootDependency] + dependencies
     }
 
+    // Если root dependency уже непустая, считаем ее источником истины и не добавляем fallback roots.
+    // Иначе берем graph roots/direct inventory refs, чтобы BOM без root graph не остался пустым.
     def rootDependsOn = new LinkedHashSet(dependencyRefList(rootDependency.dependsOn))
     if (!hasUsableRootDependency) {
         getRootDependencyRefs(bom, rootRef, directRefs).each { ref ->
@@ -1271,13 +1311,21 @@ def ensureCompleteInputDependencyGraph(def bom, def rootRef, def directRefs) {
         }
     }
 
+    // Сначала записываем root.dependsOn, чтобы reachability считалась уже с учетом fallback roots.
     rootDependency.dependsOn = rootDependsOn.collect { it }
+
+    // Проверяем, какие объявленные components/services все еще не достижимы от root.
     def reachable = collectReachableDependencyRefs(dependencies, rootRef)
+
+    // Недостижимые inventory refs подвешиваем напрямую к root.
+    // Это не выдумывает transitive edges, а только не дает итоговому SBOM "обрываться".
     knownRefs.findAll { ref -> ref != rootRef && !reachable.contains(ref) }.each { ref ->
         rootDependsOn << ref
     }
     rootDependency.dependsOn = rootDependsOn.collect { it }
 
+    // CycloneDX отличает "нет dependency entry" от "точно нет зависимостей".
+    // Поэтому для leaf refs добавляем пустую dependency entry, если ее не было.
     def dependencyRefs = dependencies.collect { it.ref?.toString()?.trim() }.findAll { it } as LinkedHashSet
     knownRefs.findAll { ref -> ref != rootRef && !dependencyRefs.contains(ref) }.each { ref ->
         dependencies << [ref: ref]
@@ -1288,17 +1336,25 @@ def ensureCompleteInputDependencyGraph(def bom, def rootRef, def directRefs) {
 }
 
 def normalizeSbomForHierarchicalMerge(def sbomPath, def normalizedDir, int index) {
+    // Читаем один входной BOM: custom/existing/scanned.
     def bom = readJSON(file: sbomPath)
 
+    // Гарантируем bom-ref у всех components/services и запоминаем refs верхнего inventory.
     def directRefs = ensureInventoryBomRefs(bom, sbomPath)
+
+    // Гарантируем metadata.component, потому что без него cyclonedx-cli --hierarchical не работает.
     def rootRef = ensureMetadataComponentForHierarchicalMerge(bom, sbomPath, directRefs)
     if (!rootRef) {
+        // Пустой BOM без subject и inventory не несет информации, поэтому его безопасно пропустить.
         echo("SBOM MERGE hierarchical skip: ${sbomPath}, reason=no metadata component and empty inventory")
         return null
     }
 
+    // Делаем dependency graph входного BOM явным до CLI:
+    // сохраняем существующие edges, добавляем root/leaf entries только там, где их не хватает.
     bom.dependencies = ensureCompleteInputDependencyGraph(bom, rootRef, directRefs)
 
+    // Пишем нормализованную копию во временную папку, исходный SBOM в проекте не меняем.
     def normalizedPath = "${normalizedDir}/normalized-${index}.json"
     writeJSON file: normalizedPath, json: bom
     echo("SBOM MERGE hierarchical normalize: ${sbomPath} -> ${normalizedPath}, reason=metadata/root dependency normalization")
@@ -1306,12 +1362,15 @@ def normalizeSbomForHierarchicalMerge(def sbomPath, def normalizedDir, int index
 }
 
 def prepareHierarchicalMergeInputs(def inputFiles, def globals) {
+    // Берем только реально существующие файлы, чтобы merge не падал на пропавших/пустых путях.
     def files = normalizeList(inputFiles).findAll { fileExists(it) }.unique()
     if (!files) return []
 
+    // Все подготовленные BOM кладем в отдельную временную директорию текущего запуска.
     def normalizedDir = "${globals.DIR_TMP}/generateSBOMCyclonedx-hierarchical-${UUID.randomUUID().toString()}"
     sh "mkdir -p ${shellQuote(normalizedDir)}"
 
+    // Нормализуем каждый входной BOM отдельно и пропускаем только полностью пустые BOM.
     def result = []
     files.eachWithIndex { sbomPath, index ->
         def normalizedPath = normalizeSbomForHierarchicalMerge(sbomPath, normalizedDir, index)
@@ -1321,7 +1380,11 @@ def prepareHierarchicalMergeInputs(def inputFiles, def globals) {
 }
 
 void mergeHierarchicalSbomFiles(def inputFiles, def outputPath, def cyclonedxCliPath, def specVersion, def rootComponent) {
+    // Создаем папку результата перед запуском CLI.
     ensureParentDirectory(outputPath)
+
+    // Единственное место, где строится общая hierarchy между BOM:
+    // template и каждый input BOM передаются в штатный cyclonedx-cli merge --hierarchical.
     sh """
         \${CYClONE_CLI}/${cyclonedxCliPath} merge \
             --input-files ${normalizeList(inputFiles).collect { shellQuote(it) }.join(' ')} \
@@ -1347,23 +1410,33 @@ void convertSbomFile(def sbomPath, def specVersion, def cyclonedxCliPath) {
 }
 
 void finalizeHierarchicalSbom(def sbomPath, def sbomTemplatePath) {
+    // Читаем результат cyclonedx-cli и исходный template с корневым компонентом приложения.
     def bom = readJSON(file: sbomPath)
     def templateBom = readJSON(file: sbomTemplatePath)
     def rootComponent = templateBom.metadata?.component
     def rootRef = rootComponent?."bom-ref"?.toString()?.trim()
 
+    // Без root из template нельзя безопасно понять, что именно надо считать верхом итогового SBOM.
     if (!rootComponent || !rootRef) {
         unstable("SBOM hierarchical finalize: root metadata component is missing in ${sbomTemplatePath}")
         return
     }
 
+    // metadata.component итогового BOM должен быть ровно из generateSBOMTemplate.
+    // CLI может собрать похожий root сам, но template содержит нужные group/name/version/purl/type.
     bom.metadata = bom.metadata instanceof Map ? bom.metadata : [:]
     bom.metadata.component = rootComponent
 
+    // Когда template передан как input, cyclonedx-cli может создать техническую materialized ссылку root:root.
+    // Собираем все ref-алиасы root, чтобы удалить только self/root мусор.
     def rootComponentRefs = [rootRef, "${rootRef}:${rootRef}"] as LinkedHashSet
+
+    // Убираем top-level component, который дублирует metadata.component.
+    // Все реальные project components, созданные из остальных input BOM, остаются нетронутыми.
     bom.components = normalizeList(bom.components).findAll { component ->
         if (!(component instanceof Map)) return true
 
+        // Сравниваем и по ref, и по identity, потому что CLI может префиксовать ref при hierarchical merge.
         def componentRef = component["bom-ref"]?.toString()?.trim()
         def sameRootIdentity = component.purl?.toString() == rootComponent.purl?.toString() ||
             (
@@ -1373,6 +1446,7 @@ void finalizeHierarchicalSbom(def sbomPath, def sbomTemplatePath) {
             )
 
         if (componentRef == rootRef || sameRootIdentity) {
+            // Запоминаем ref удаленного root-дубликата, чтобы убрать ссылки на него из root dependency.
             if (componentRef) rootComponentRefs << componentRef
             return false
         }
@@ -1385,40 +1459,60 @@ void finalizeHierarchicalSbom(def sbomPath, def sbomTemplatePath) {
     def otherDependencies = []
     def foundRootDependency = false
 
+    // Не пересобираем dependency graph после CLI.
+    // Проходим по entries только чтобы схлопнуть root dependency и убрать root -> root.
     normalizeList(bom.dependencies).findAll { it instanceof Map }.each { dependency ->
         def ref = dependency.ref?.toString()?.trim()
         if (ref == rootRef) {
             foundRootDependency = true
+
+            // Из root.dependsOn убираем только ссылки на сам root/template aliases.
+            // Все остальные children root - это результат cyclonedx-cli --hierarchical.
             dependencyRefList(dependency.dependsOn).findAll { !rootComponentRefs.contains(it) }.each { rootDependsOn << it }
             dependencyRefList(dependency.provides).findAll { !rootComponentRefs.contains(it) }.each { rootProvides << it }
         } else if (rootComponentRefs.contains(ref)) {
-            // This is the template component materialized by cyclonedx-cli; root metadata already represents it.
+            // Это dependency entry для materialized template component.
+            // Ее удаляем, потому что template уже представлен как bom.metadata.component.
         } else {
+            // Остальные dependency entries оставляем ровно как выдал cyclonedx-cli.
             otherDependencies << dependency
         }
     }
 
+    // Возвращаем root dependency первой записью, чтобы дерево начиналось с компонента из generateSBOMTemplate.
     def rootDependency = [ref: rootRef, dependsOn: rootDependsOn.collect { it }]
     if (rootProvides) {
         rootDependency.provides = rootProvides.collect { it }
     }
 
+    // Если CLI root не создал, все равно пишем пустой root dependency.
+    // Это явный leaf root для template-only merge.
     bom.dependencies = (foundRootDependency || otherDependencies) ?
         ([rootDependency] + otherDependencies) :
         [rootDependency]
 
+    // Записываем только очищенный итоговый BOM; исходные input BOM остаются без изменений.
     writeJSON file: sbomPath, json: bom
 }
 
 // hierarchical merge должен видеть template и каждый входной SBOM как отдельные subjects; graph строит cyclonedx-cli.
 void mergeSbomFiles(def inputFiles, def mergedPath, def specVersion, def cyclonedxCliPath, def globals, boolean parallelMergeEnabled, def sbomTemplatePath) {
+    // Root component берем из template, который создан generateSBOMTemplate.
     def templateBom = readJSON(file: sbomTemplatePath)
     def rootComponent = templateBom.metadata?.component
+
+    // Все реальные входные BOM нормализуются до запуска CLI.
     def files = prepareHierarchicalMergeInputs(inputFiles, globals)
+
+    // Template обязательно идет первым input, чтобы он был верхним subject итогового merge.
     def mergeFiles = ([sbomTemplatePath] + files.findAll { it != sbomTemplatePath }).unique()
 
     echo("SBOM MERGE hierarchical: files=${mergeFiles.size()}, parallel_merge=${parallelMergeEnabled}, output=${mergedPath}")
+
+    // Общий graph строит cyclonedx-cli --hierarchical.
     mergeHierarchicalSbomFiles(mergeFiles, mergedPath, cyclonedxCliPath, specVersion, rootComponent)
+
+    // После CLI убираем только технические root-дубли и self-dependency.
     finalizeHierarchicalSbom(mergedPath, sbomTemplatePath)
 }
 
