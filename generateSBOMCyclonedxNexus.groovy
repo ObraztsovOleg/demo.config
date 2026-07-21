@@ -221,10 +221,10 @@ def extractTgz(def projectDirs, def excludedDirs = []) {
 
         tgzPaths.each { tgzPath ->
             def objectFilePath = "${tgzDir}/${sha256Text(tgzPath).take(16)}"
-            sh """
+            sh shellScript("""
                 mkdir -p "${objectFilePath}"
                 tar -xvzf "${tgzPath}" -C "${objectFilePath}"
-            """
+            """)
         }
 
         if (tgzPaths) {
@@ -1122,6 +1122,11 @@ void writeJqFilterFile(def filePath, def filterText) {
     writeTextFile(filePath, filterText.toString().stripIndent().trim() + "\n")
 }
 
+def shellScript(def scriptText) {
+    // В коде shell-блоки остаются читаемыми с отступами, а Jenkins получает команду без пустой первой строки.
+    return scriptText.toString().stripIndent().trim()
+}
+
 def parseSbomGraphInfo(def graphText) {
     def info = [
         rootRef: "",
@@ -1288,7 +1293,7 @@ void normalizeSbomJsonShape(def sbomPath, def normalizedPath, def subjectName, d
 
     // jq нормализует форму большого BOM во внешнем процессе: Groovy не читает весь JSON.
     // Фильтр передаем через файл, чтобы Jenkins-log не печатал длинный jq-код inline.
-    sh """
+    sh shellScript("""
         set -e
         command -v jq >/dev/null 2>&1 || { echo 'SBOM hierarchical normalize requires jq'; exit 1; }
         filter_file=${shellQuote(filterPath)}
@@ -1299,7 +1304,7 @@ void normalizeSbomJsonShape(def sbomPath, def normalizedPath, def subjectName, d
 
         rm -f "\$filter_file"
         trap - EXIT
-    """
+    """)
 }
 
 def collectSbomGraphInfo(def normalizedPath) {
@@ -1341,10 +1346,10 @@ def collectSbomGraphInfo(def normalizedPath) {
 
     try {
         return parseSbomGraphInfo(sh(
-            script: """
+            script: shellScript("""
                 set -e
                 jq -r -f ${shellQuote(filterPath)} ${shellQuote(normalizedPath)}
-            """,
+            """),
             returnStdout: true
         ))
     } finally {
@@ -1379,7 +1384,7 @@ void applyNormalizedDependencyGraph(def normalizedPath, def rootRef, def rootDep
     writeJqFilterFile(filterPath, dependencyGraphFilter)
 
     // jq применяет рассчитанные Groovy списки к BOM и пишет новую копию атомарной заменой.
-    sh """
+    sh shellScript("""
         set -e
         tmp_file=${shellQuote(tmpPath)}
         root_depends_on_file=${shellQuote(rootDependsOnPath)}
@@ -1393,7 +1398,7 @@ void applyNormalizedDependencyGraph(def normalizedPath, def rootRef, def rootDep
         mv "\$tmp_file" ${shellQuote(normalizedPath)}
         rm -f "\$root_depends_on_file" "\$leaf_refs_file" "\$filter_file"
         trap - EXIT
-    """
+    """)
 }
 
 def normalizeSbomForHierarchicalMerge(def sbomPath, def normalizedDir, int index) {
@@ -1447,7 +1452,7 @@ void mergeHierarchicalSbomFiles(def inputFiles, def outputPath, def cyclonedxCli
 
     // Единственное место, где строится общая hierarchy между BOM:
     // template и каждый input BOM передаются в штатный cyclonedx-cli merge --hierarchical.
-    sh """
+    sh shellScript("""
         command -v jq >/dev/null 2>&1 || { echo 'SBOM hierarchical merge requires jq'; exit 1; }
 
         root_group=\$(jq -r '.metadata.component.group // ""' ${shellQuote(sbomTemplatePath)})
@@ -1468,18 +1473,18 @@ void mergeHierarchicalSbomFiles(def inputFiles, def outputPath, def cyclonedxCli
             --group "\$root_group" \
             --name "\$root_name" \
             --version "\$root_version"
-    """
+    """)
 }
 
 // Финальная конвертация оставлена отдельным шагом, как в исходном сценарии.
 void convertSbomFile(def sbomPath, def specVersion, def cyclonedxCliPath) {
     ensureParentDirectory(sbomPath)
-    sh """
+    sh shellScript("""
         \${CYClONE_CLI}/${cyclonedxCliPath} convert \
             --output-version ${specVersion} \
             --input-file ${shellQuote(sbomPath)} \
             --output-file ${shellQuote(sbomPath)}
-    """
+    """)
 }
 
 void finalizeHierarchicalSbom(def sbomPath, def sbomTemplatePath) {
@@ -1564,7 +1569,7 @@ def as_array:
 
     // Финальный cleanup делаем через jq, чтобы Jenkins/Groovy не поднимал большой merged BOM в память.
     // Каждый jq-фильтр делает один маленький шаг: достать root, заменить metadata/component, почистить root dependency.
-    sh """
+    sh shellScript("""
         set -e
         command -v jq >/dev/null 2>&1 || { echo 'SBOM hierarchical finalize requires jq'; exit 1; }
 
@@ -1593,7 +1598,7 @@ def as_array:
         rm -f "\$tmp_file" "\$root_component_file" "\$root_refs_file" "\$root_aliases_filter_file" "\$replace_root_filter_file" "\$cleanup_root_filter_file"
 
         trap - EXIT
-    """
+    """)
 }
 
 // hierarchical merge должен видеть template и каждый входной SBOM как отдельные subjects; graph строит cyclonedx-cli.
