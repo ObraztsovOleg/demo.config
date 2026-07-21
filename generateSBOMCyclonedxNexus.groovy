@@ -1221,6 +1221,72 @@ def getRootDependencyRefs(def bom, def rootRef, def directRefs) {
     return graphRoots ?: normalizeList(directRefs).findAll { it != rootRef }.unique()
 }
 
+def collectReachableDependencyRefs(def dependencies, def rootRef) {
+    def dependencyRefs = [:].withDefault { new LinkedHashSet() }
+    normalizeList(dependencies).findAll { it instanceof Map }.each { dependency ->
+        def ref = dependency.ref?.toString()?.trim()
+        if (ref) {
+            dependencyRefList(dependency.dependsOn).each { childRef ->
+                dependencyRefs[ref] << childRef
+            }
+        }
+    }
+
+    def reachable = new LinkedHashSet()
+    def queue = new ArrayDeque()
+    if (rootRef) {
+        reachable << rootRef
+        queue.add(rootRef)
+    }
+
+    while (!queue.isEmpty()) {
+        def ref = queue.removeFirst()
+        dependencyRefs[ref].each { childRef ->
+            if (!reachable.contains(childRef)) {
+                reachable << childRef
+                queue.add(childRef)
+            }
+        }
+    }
+
+    return reachable
+}
+
+// Делает входной graph явным: не придумывает transitives, но не оставляет inventory refs оторванными от root.
+def ensureCompleteInputDependencyGraph(def bom, def rootRef, def directRefs) {
+    def dependencies = normalizeList(bom.dependencies).findAll { it instanceof Map }
+    def knownRefs = collectKnownBomRefs(bom)
+    def rootDependency = dependencies.find { it.ref?.toString()?.trim() == rootRef }
+    def hasUsableRootDependency = dependencyRefList(rootDependency?.dependsOn)
+
+    if (!rootDependency) {
+        rootDependency = [ref: rootRef, dependsOn: []]
+        dependencies = [rootDependency] + dependencies
+    }
+
+    def rootDependsOn = new LinkedHashSet(dependencyRefList(rootDependency.dependsOn))
+    if (!hasUsableRootDependency) {
+        getRootDependencyRefs(bom, rootRef, directRefs).each { ref ->
+            if (ref != rootRef) rootDependsOn << ref
+        }
+    }
+
+    rootDependency.dependsOn = rootDependsOn.collect { it }
+    def reachable = collectReachableDependencyRefs(dependencies, rootRef)
+    knownRefs.findAll { ref -> ref != rootRef && !reachable.contains(ref) }.each { ref ->
+        rootDependsOn << ref
+    }
+    rootDependency.dependsOn = rootDependsOn.collect { it }
+
+    def dependencyRefs = dependencies.collect { it.ref?.toString()?.trim() }.findAll { it } as LinkedHashSet
+    knownRefs.findAll { ref -> ref != rootRef && !dependencyRefs.contains(ref) }.each { ref ->
+        dependencies << [ref: ref]
+        dependencyRefs << ref
+    }
+
+    return dependencies
+}
+
 def normalizeSbomForHierarchicalMerge(def sbomPath, def normalizedDir, int index) {
     def bom = readJSON(file: sbomPath)
 
@@ -1231,12 +1297,7 @@ def normalizeSbomForHierarchicalMerge(def sbomPath, def normalizedDir, int index
         return null
     }
 
-    def dependencies = normalizeList(bom.dependencies).findAll { it instanceof Map }
-    def hasRootDependency = dependencies.any { it.ref?.toString()?.trim() == rootRef }
-    if (!hasRootDependency) {
-        dependencies = [[ref: rootRef, dependsOn: getRootDependencyRefs(bom, rootRef, directRefs)]] + dependencies
-    }
-    bom.dependencies = dependencies
+    bom.dependencies = ensureCompleteInputDependencyGraph(bom, rootRef, directRefs)
 
     def normalizedPath = "${normalizedDir}/normalized-${index}.json"
     writeJSON file: normalizedPath, json: bom
