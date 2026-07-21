@@ -1094,81 +1094,6 @@ void ensureParentDirectory(def filePath) {
     }
 }
 
-def dependencyRefList(def value) {
-    return normalizeList(value).collect { it?.toString()?.trim() }.findAll { it }
-}
-
-def getComponentBomRef(def component, def seed, int index) {
-    if (!(component instanceof Map)) return null
-
-    def ref = component["bom-ref"]?.toString()?.trim()
-    if (!ref) ref = component.purl?.toString()?.trim()
-    if (!ref) {
-        def name = component.name?.toString()?.trim() ?: "component"
-        def version = component.version?.toString()?.trim() ?: "unknown"
-        ref = "generated-${sha256Text("${seed}:${index}:${component.type}:${component.group}:${name}:${version}").take(32)}"
-    }
-    component["bom-ref"] = ref
-
-    normalizeList(component.components).eachWithIndex { child, childIndex ->
-        getComponentBomRef(child, "${seed}:${index}", childIndex)
-    }
-    return ref
-}
-
-def getServiceBomRef(def service, def seed, int index) {
-    if (!(service instanceof Map)) return null
-
-    def ref = service["bom-ref"]?.toString()?.trim()
-    if (!ref) {
-        def name = service.name?.toString()?.trim() ?: "service"
-        ref = "generated-service-${sha256Text("${seed}:${index}:${name}").take(32)}"
-        service["bom-ref"] = ref
-    }
-    return ref
-}
-
-void collectComponentBomRefs(def components, def refs) {
-    // Собираем bom-ref не только у верхних components, но и у вложенных components.
-    // Это нужно для CycloneDX BOM, где компоненты могут быть иерархическими сами по себе.
-    normalizeList(components).findAll { it instanceof Map }.each { component ->
-        def ref = component["bom-ref"]?.toString()?.trim()
-        if (ref) refs << ref
-        collectComponentBomRefs(component.components, refs)
-    }
-}
-
-def ensureInventoryBomRefs(def bom, def seed) {
-    def directRefs = new LinkedHashSet()
-
-    // Перед merge у каждого component должен быть bom-ref.
-    // Если его нет, getComponentBomRef создаст стабильный synthetic ref.
-    normalizeList(bom.components).findAll { it instanceof Map }.eachWithIndex { component, index ->
-        def ref = getComponentBomRef(component, seed, index)
-        if (ref) directRefs << ref
-    }
-
-    // services тоже участвуют в dependency graph через bom-ref, поэтому нормализуем их так же.
-    normalizeList(bom.services).findAll { it instanceof Map }.eachWithIndex { service, index ->
-        def ref = getServiceBomRef(service, seed, index)
-        if (ref) directRefs << ref
-    }
-
-    return directRefs as List
-}
-
-def collectKnownBomRefs(def bom) {
-    def refs = new LinkedHashSet()
-
-    // Это полный inventory входного BOM: все components + services, которые могут появиться в dependencies.
-    collectComponentBomRefs(bom.components, refs)
-    normalizeList(bom.services).findAll { it instanceof Map }.each { service ->
-        def ref = service["bom-ref"]?.toString()?.trim()
-        if (ref) refs << ref
-    }
-    return refs
-}
-
 def getSbomSubjectName(def sbomPath) {
     def path = sbomPath?.toString()
     if (!path) return "sbom"
@@ -1182,88 +1107,46 @@ def getSbomSubjectName(def sbomPath) {
     return getPathTail(path) ?: "sbom"
 }
 
-def ensureMetadataComponentForHierarchicalMerge(def bom, def sbomPath, def directRefs) {
-    // cyclonedx-cli merge --hierarchical требует metadata.component у каждого input BOM.
-    // Поэтому сначала гарантируем, что metadata является объектом.
-    bom.metadata = bom.metadata instanceof Map ? bom.metadata : [:]
+void writeJsonArrayFile(def filePath, def values) {
+    ensureParentDirectory(filePath)
+    writeFile file: filePath, text: groovy.json.JsonOutput.toJson(normalizeList(values))
+}
 
-    // Если входной BOM уже описывает свой subject/root, сохраняем его и только дополняем пустые поля.
-    def component = bom.metadata.component instanceof Map ? bom.metadata.component : null
-
-    if (component) {
-        // bom-ref нужен CLI как ключ subject'а. Приоритет: существующий bom-ref -> purl -> synthetic ref.
-        def ref = component["bom-ref"]?.toString()?.trim()
-        if (!ref) ref = component.purl?.toString()?.trim()
-        if (!ref) {
-            // synthetic ref строится от пути файла и inventory refs, чтобы одинаковый BOM получал одинаковый root ref.
-            def seed = "${sbomPath}:${directRefs.join('|')}:${component.group}:${component.name}:${component.version}"
-            ref = "generated-root-${sha256Text(seed).take(32)}"
-        }
-
-        // Не перетираем существующие значения, а заполняем только то, без чего CLI может упасть или создать плохой subject.
-        component["bom-ref"] = ref
-        if (!component.type?.toString()?.trim()) component.type = "application"
-        if (!component.name?.toString()?.trim()) component.name = getSbomSubjectName(sbomPath)
-        if (!component.version?.toString()?.trim()) component.version = "0"
-        bom.metadata.component = component
-        return ref
-    }
-
-    // Если metadata.component нет и inventory пустой, такой BOM нечего подвешивать в hierarchy.
-    if (!directRefs) return null
-
-    // Если metadata.component нет, но components/services есть, создаем synthetic subject входного BOM.
-    // Это не зависимость приложения, а технический root конкретного input BOM для hierarchical merge.
-    def syntheticRef = "generated-root-${sha256Text("${sbomPath}:${directRefs.join('|')}").take(32)}"
-    bom.metadata.component = [
-        type: "application",
-        "bom-ref": syntheticRef,
-        name: getSbomSubjectName(sbomPath),
-        version: "0"
+def parseSbomGraphInfo(def graphText) {
+    def info = [
+        rootRef: "",
+        directRefs: new LinkedHashSet(),
+        knownRefs: new LinkedHashSet(),
+        dependencyRefs: new LinkedHashSet(),
+        edges: [:].withDefault { new LinkedHashSet() }
     ]
-    return syntheticRef
-}
 
-def getRootDependencyRefs(def bom, def rootRef, def directRefs) {
-    def dependencies = normalizeList(bom.dependencies).findAll { it instanceof Map }
-    def knownRefs = collectKnownBomRefs(bom)
-    def childRefs = new LinkedHashSet()
-
-    // Запоминаем все refs, на которые кто-то уже ссылается как на child.
-    // Такие refs не должны становиться root-level dependency, если graph уже описан.
-    dependencies.each { dependency ->
-        dependencyRefList(dependency.dependsOn).each { childRef ->
-            if (childRef != rootRef) childRefs << childRef
-        }
-    }
-
-    // Если у BOM нет root dependency, root candidates берем из dependency entries,
-    // которые есть в inventory и не являются child других entries.
-    def graphRoots = dependencies.collect { dependency ->
-        dependency.ref?.toString()?.trim()
-    }.findAll { ref ->
-        ref && ref != rootRef && knownRefs.contains(ref) && !childRefs.contains(ref)
-    }.unique()
-
-    // Если graph roots найти нельзя, fallback - прямой inventory верхнего уровня.
-    // Это нужно для artifact-only или malformed BOM, где graph отсутствует.
-    return graphRoots ?: normalizeList(directRefs).findAll { it != rootRef }.unique()
-}
-
-def collectReachableDependencyRefs(def dependencies, def rootRef) {
-    def dependencyRefs = [:].withDefault { new LinkedHashSet() }
-
-    // Строим adjacency map: dependency.ref -> dependency.dependsOn.
-    // Здесь ничего не придумываем, только читаем то, что уже есть во входном graph.
-    normalizeList(dependencies).findAll { it instanceof Map }.each { dependency ->
-        def ref = dependency.ref?.toString()?.trim()
-        if (ref) {
-            dependencyRefList(dependency.dependsOn).each { childRef ->
-                dependencyRefs[ref] << childRef
+    // jq отдает только компактный graph index, а не весь BOM.
+    // Формат строк: KIND<TAB>ref или EDGE<TAB>parent<TAB>child.
+    graphText.toString().readLines().each { line ->
+        def parts = line.split("\t", -1)
+        if (parts.size() >= 2) {
+            def kind = parts[0]
+            def ref = parts[1]?.trim()
+            if (kind == "ROOT") {
+                info.rootRef = ref ?: ""
+            } else if (kind == "DIRECT" && ref) {
+                info.directRefs << ref
+            } else if (kind == "KNOWN" && ref) {
+                info.knownRefs << ref
+            } else if (kind == "DEP" && ref) {
+                info.dependencyRefs << ref
+            } else if (kind == "EDGE" && ref && parts.size() >= 3) {
+                def childRef = parts[2]?.trim()
+                if (childRef) info.edges[ref] << childRef
             }
         }
     }
 
+    return info
+}
+
+def collectReachableGraphRefs(def edges, def rootRef, def rootDependsOn) {
     def reachable = new LinkedHashSet()
     def queue = new ArrayDeque()
     if (rootRef) {
@@ -1275,7 +1158,8 @@ def collectReachableDependencyRefs(def dependencies, def rootRef) {
     // Обычный BFS по dependsOn, чтобы понять какие refs реально достижимы от root.
     while (!queue.isEmpty()) {
         def ref = queue.removeFirst()
-        dependencyRefs[ref].each { childRef ->
+        def childRefs = ref == rootRef ? rootDependsOn : edges[ref]
+        childRefs.each { childRef ->
             if (!reachable.contains(childRef)) {
                 reachable << childRef
                 queue.add(childRef)
@@ -1286,80 +1170,221 @@ def collectReachableDependencyRefs(def dependencies, def rootRef) {
     return reachable
 }
 
-// Делает входной graph явным: не придумывает transitives, но не оставляет inventory refs оторванными от root.
-def ensureCompleteInputDependencyGraph(def bom, def rootRef, def directRefs) {
-    // Берем только валидные dependency objects из входного BOM.
-    def dependencies = normalizeList(bom.dependencies).findAll { it instanceof Map }
+def getPreparedDependencyGraph(def info) {
+    def rootRef = info.rootRef
+    def rootDependsOn = new LinkedHashSet(info.edges[rootRef] ?: [])
 
-    // knownRefs - все refs, которые объявлены в components/services этого BOM.
-    def knownRefs = collectKnownBomRefs(bom)
-
-    // rootDependency - запись dependencies для metadata.component текущего input BOM.
-    def rootDependency = dependencies.find { it.ref?.toString()?.trim() == rootRef }
-    def hasUsableRootDependency = dependencyRefList(rootDependency?.dependsOn)
-
-    // Если root dependency отсутствует, создаем ее.
-    // Это минимальная подготовка для hierarchical merge, а не построение package graph.
-    if (!rootDependency) {
-        rootDependency = [ref: rootRef, dependsOn: []]
-        dependencies = [rootDependency] + dependencies
-    }
-
-    // Если root dependency уже непустая, считаем ее источником истины и не добавляем fallback roots.
+    // Если root dependency уже непустая, считаем ее источником истины.
     // Иначе берем graph roots/direct inventory refs, чтобы BOM без root graph не остался пустым.
-    def rootDependsOn = new LinkedHashSet(dependencyRefList(rootDependency.dependsOn))
+    def hasUsableRootDependency = rootDependsOn.size() > 0
     if (!hasUsableRootDependency) {
-        getRootDependencyRefs(bom, rootRef, directRefs).each { ref ->
-            if (ref != rootRef) rootDependsOn << ref
+        def childRefs = new LinkedHashSet()
+        info.edges.each { _, children ->
+            children.findAll { it != rootRef }.each { childRefs << it }
         }
+
+        def graphRoots = info.dependencyRefs.findAll { ref ->
+            ref && ref != rootRef && info.knownRefs.contains(ref) && !childRefs.contains(ref)
+        }
+        def fallbackRefs = graphRoots ?: info.directRefs.findAll { it != rootRef }
+        fallbackRefs.each { ref -> rootDependsOn << ref }
     }
 
-    // Сначала записываем root.dependsOn, чтобы reachability считалась уже с учетом fallback roots.
-    rootDependency.dependsOn = rootDependsOn.collect { it }
-
-    // Проверяем, какие объявленные components/services все еще не достижимы от root.
-    def reachable = collectReachableDependencyRefs(dependencies, rootRef)
+    def reachable = collectReachableGraphRefs(info.edges, rootRef, rootDependsOn)
 
     // Недостижимые inventory refs подвешиваем напрямую к root.
     // Это не выдумывает transitive edges, а только не дает итоговому SBOM "обрываться".
-    knownRefs.findAll { ref -> ref != rootRef && !reachable.contains(ref) }.each { ref ->
+    info.knownRefs.findAll { ref -> ref != rootRef && !reachable.contains(ref) }.each { ref ->
         rootDependsOn << ref
     }
-    rootDependency.dependsOn = rootDependsOn.collect { it }
 
     // CycloneDX отличает "нет dependency entry" от "точно нет зависимостей".
     // Поэтому для leaf refs добавляем пустую dependency entry, если ее не было.
-    def dependencyRefs = dependencies.collect { it.ref?.toString()?.trim() }.findAll { it } as LinkedHashSet
-    knownRefs.findAll { ref -> ref != rootRef && !dependencyRefs.contains(ref) }.each { ref ->
-        dependencies << [ref: ref]
-        dependencyRefs << ref
-    }
+    def dependencyRefs = new LinkedHashSet(info.dependencyRefs)
+    dependencyRefs << rootRef
+    def leafRefs = info.knownRefs.findAll { ref -> ref != rootRef && !dependencyRefs.contains(ref) }
 
-    return dependencies
+    return [
+        rootDependsOn: rootDependsOn.collect { it },
+        leafRefs: leafRefs.collect { it }
+    ]
+}
+
+void normalizeSbomJsonShape(def sbomPath, def normalizedPath, def subjectName, def syntheticRootRef) {
+    def normalizeShapeFilter = [
+        'def as_array:',
+        '  if . == null then []',
+        '  elif type == "array" then .',
+        '  elif type == "object" then [.]',
+        '  else [] end;',
+        '',
+        'def as_object:',
+        '  if type == "object" then . else {} end;',
+        '',
+        'def text:',
+        '  if . == null then "" else tostring end;',
+        '',
+        'def generated_ref($prefix; $seed):',
+        '  $prefix + ($seed | @uri);',
+        '',
+        'def normalize_component($seed):',
+        '  if type != "object" then .',
+        '  else',
+        '    (.name // "component" | text) as $name',
+        '    | (.version // "unknown" | text) as $version',
+        '    | (.type // "" | text) as $type',
+        '    | (.group // "" | text) as $group',
+        '    | .["bom-ref"] = ((.["bom-ref"] // .purl // generated_ref("generated-"; [$seed, $type, $group, $name, $version] | join(":"))) | text)',
+        '    | .components = ((.components | as_array) | to_entries | map(. as $entry | $entry.value | normalize_component($seed + ":" + ($entry.key | tostring))))',
+        '  end;',
+        '',
+        'def normalize_service($seed):',
+        '  if type != "object" then .',
+        '  else',
+        '    (.name // "service" | text) as $name',
+        '    | .["bom-ref"] = ((.["bom-ref"] // generated_ref("generated-service-"; [$seed, $name] | join(":"))) | text)',
+        '  end;',
+        '',
+        'def direct_refs:',
+        '  [',
+        '    ((.components | as_array)[]? | select(type == "object") | .["bom-ref"]),',
+        '    ((.services | as_array)[]? | select(type == "object") | .["bom-ref"])',
+        '  ]',
+        '  | map(select(. != null and (tostring | length > 0)) | tostring);',
+        '',
+        '.metadata = ((.metadata // {}) | as_object)',
+        '| .components = ((.components | as_array) | to_entries | map(. as $entry | $entry.value | normalize_component("component:" + ($entry.key | tostring))))',
+        '| .services = ((.services | as_array) | to_entries | map(. as $entry | $entry.value | normalize_service("service:" + ($entry.key | tostring))))',
+        '| if (.metadata.component | type) == "object" then',
+        '    .metadata.component |= (',
+        '      .["bom-ref"] = ((.["bom-ref"] // .purl // $syntheticRootRef) | text)',
+        '      | if ((.type // "" | text) == "") then .type = "application" else . end',
+        '      | if ((.name // "" | text) == "") then .name = $subjectName else . end',
+        '      | if ((.version // "" | text) == "") then .version = "0" else . end',
+        '    )',
+        '  elif ((direct_refs | length) > 0) then',
+        '    .metadata.component = {',
+        '      type: "application",',
+        '      "bom-ref": $syntheticRootRef,',
+        '      name: $subjectName,',
+        '      version: "0"',
+        '    }',
+        '  else',
+        '    .',
+        '  end'
+    ].join("\n")
+
+    // jq нормализует форму большого BOM во внешнем процессе: Groovy не читает весь JSON.
+    sh """
+        command -v jq >/dev/null 2>&1 || { echo 'SBOM hierarchical normalize requires jq'; exit 1; }
+        jq --arg subjectName ${shellQuote(subjectName)} --arg syntheticRootRef ${shellQuote(syntheticRootRef)} ${shellQuote(normalizeShapeFilter)} ${shellQuote(sbomPath)} > ${shellQuote(normalizedPath)}
+    """
+}
+
+def collectSbomGraphInfo(def normalizedPath) {
+    def graphInfoFilter = [
+        'def as_array:',
+        '  if . == null then []',
+        '  elif type == "array" then .',
+        '  elif type == "object" then [.]',
+        '  else [] end;',
+        '',
+        'def component_objects($items):',
+        '  ($items | as_array)[]?',
+        '  | select(type == "object")',
+        '  | ., component_objects(.components);',
+        '',
+        'def direct_refs:',
+        '  [',
+        '    ((.components | as_array)[]? | select(type == "object") | .["bom-ref"]),',
+        '    ((.services | as_array)[]? | select(type == "object") | .["bom-ref"])',
+        '  ]',
+        '  | map(select(. != null and (tostring | length > 0)) | tostring);',
+        '',
+        'def known_refs:',
+        '  [',
+        '    (component_objects(.components) | .["bom-ref"]),',
+        '    ((.services | as_array)[]? | select(type == "object") | .["bom-ref"])',
+        '  ]',
+        '  | map(select(. != null and (tostring | length > 0)) | tostring);',
+        '',
+        '(.metadata.component["bom-ref"] // "" | tostring) as $rootRef',
+        '| "ROOT\\t\\($rootRef)",',
+        '  (direct_refs[] | "DIRECT\\t\\(.)"),',
+        '  (known_refs[] | "KNOWN\\t\\(.)"),',
+        '  ((.dependencies | as_array)[]? | select(type == "object") | (.ref // "" | tostring) as $ref | select($ref != "") | "DEP\\t\\($ref)"),',
+        '  ((.dependencies | as_array)[]? | select(type == "object") | (.ref // "" | tostring) as $ref | select($ref != "") | (.dependsOn | as_array)[]? | tostring | "EDGE\\t\\($ref)\\t\\(.)")'
+    ].join("\n")
+
+    return parseSbomGraphInfo(sh(
+        script: "jq -r ${shellQuote(graphInfoFilter)} ${shellQuote(normalizedPath)}",
+        returnStdout: true
+    ))
+}
+
+void applyNormalizedDependencyGraph(def normalizedPath, def rootRef, def rootDependsOn, def leafRefs) {
+    def dependencyGraphFilter = [
+        'def as_array:',
+        '  if . == null then []',
+        '  elif type == "array" then .',
+        '  else [] end;',
+        '',
+        '($rootDependsOn[0]) as $rootChildren',
+        '| ($leafRefs[0]) as $leafs',
+        '| (.dependencies | as_array | map(select(type == "object"))) as $deps',
+        '| ($deps | map(select((.ref // "" | tostring) == $rootRef)) | first // {ref: $rootRef}) as $rootDependency',
+        '| .dependencies = (',
+        '    [($rootDependency | .ref = $rootRef | .dependsOn = $rootChildren)]',
+        '    + ($deps | map(select((.ref // "" | tostring) != $rootRef)))',
+        '    + ($leafs | map({ref: .}))',
+        '  )'
+    ].join("\n")
+    def rootDependsOnPath = "${normalizedPath}.root-depends-on-${UUID.randomUUID().toString()}.json"
+    def leafRefsPath = "${normalizedPath}.leaf-refs-${UUID.randomUUID().toString()}.json"
+    def tmpPath = "${normalizedPath}.deps-${UUID.randomUUID().toString()}.tmp"
+
+    writeJsonArrayFile(rootDependsOnPath, rootDependsOn)
+    writeJsonArrayFile(leafRefsPath, leafRefs)
+
+    // jq применяет рассчитанные Groovy списки к BOM и пишет новую копию атомарной заменой.
+    sh """
+        set -e
+        tmp_file=${shellQuote(tmpPath)}
+        root_depends_on_file=${shellQuote(rootDependsOnPath)}
+        leaf_refs_file=${shellQuote(leafRefsPath)}
+        trap 'rm -f "\$tmp_file" "\$root_depends_on_file" "\$leaf_refs_file"' EXIT
+
+        jq --arg rootRef ${shellQuote(rootRef)} --slurpfile rootDependsOn "\$root_depends_on_file" --slurpfile leafRefs "\$leaf_refs_file" ${shellQuote(dependencyGraphFilter)} ${shellQuote(normalizedPath)} > "\$tmp_file"
+
+        mv "\$tmp_file" ${shellQuote(normalizedPath)}
+        rm -f "\$root_depends_on_file" "\$leaf_refs_file"
+        trap - EXIT
+    """
 }
 
 def normalizeSbomForHierarchicalMerge(def sbomPath, def normalizedDir, int index) {
-    // Читаем один входной BOM: custom/existing/scanned.
-    def bom = readJSON(file: sbomPath)
+    def normalizedPath = "${normalizedDir}/normalized-${index}.json"
+    def syntheticRootRef = "generated-root-${sha256Text(sbomPath).take(32)}"
+    def subjectName = getSbomSubjectName(sbomPath)
 
-    // Гарантируем bom-ref у всех components/services и запоминаем refs верхнего inventory.
-    def directRefs = ensureInventoryBomRefs(bom, sbomPath)
+    // Читаем и переписываем большой input BOM через jq, а не через Jenkins readJSON/writeJSON.
+    normalizeSbomJsonShape(sbomPath, normalizedPath, subjectName, syntheticRootRef)
 
-    // Гарантируем metadata.component, потому что без него cyclonedx-cli --hierarchical не работает.
-    def rootRef = ensureMetadataComponentForHierarchicalMerge(bom, sbomPath, directRefs)
+    def graphInfo = collectSbomGraphInfo(normalizedPath)
+    def rootRef = graphInfo.rootRef?.toString()?.trim()
     if (!rootRef) {
         // Пустой BOM без subject и inventory не несет информации, поэтому его безопасно пропустить.
         echo("SBOM MERGE hierarchical skip: ${sbomPath}, reason=no metadata component and empty inventory")
+        sh "rm -f ${shellQuote(normalizedPath)}"
         return null
     }
 
     // Делаем dependency graph входного BOM явным до CLI:
     // сохраняем существующие edges, добавляем root/leaf entries только там, где их не хватает.
-    bom.dependencies = ensureCompleteInputDependencyGraph(bom, rootRef, directRefs)
+    def preparedGraph = getPreparedDependencyGraph(graphInfo)
+    applyNormalizedDependencyGraph(normalizedPath, rootRef, preparedGraph.rootDependsOn, preparedGraph.leafRefs)
 
     // Пишем нормализованную копию во временную папку, исходный SBOM в проекте не меняем.
-    def normalizedPath = "${normalizedDir}/normalized-${index}.json"
-    writeJSON file: normalizedPath, json: bom
     echo("SBOM MERGE hierarchical normalize: ${sbomPath} -> ${normalizedPath}, reason=metadata/root dependency normalization")
     return normalizedPath
 }
@@ -1452,7 +1477,7 @@ void finalizeHierarchicalSbom(def sbomPath, def sbomTemplatePath) {
   ]
 | map(select(. != ""))
 | unique
-'''
+''';
     def replaceRootComponentFilter = '''
 ($root[0]) as $r
 | ($rootRefs[0]) as $refs
@@ -1470,7 +1495,7 @@ void finalizeHierarchicalSbom(def sbomPath, def sbomTemplatePath) {
         end
       )
   )
-'''
+''';
     def cleanupRootDependencyFilter = '''
 def as_array:
   if . == null then []
@@ -1490,7 +1515,7 @@ def as_array:
        | (.ref // "" | tostring) as $ref
        | select($ref != $rootRef and (($refs | index($ref)) == null))]
   )
-'''
+''';
     def tmpPath = "${sbomPath}.finalized-${UUID.randomUUID().toString()}.tmp"
     def tmpNextPath = "${tmpPath}.next"
     def rootComponentPath = "${sbomPath}.root-component-${UUID.randomUUID().toString()}.tmp"
