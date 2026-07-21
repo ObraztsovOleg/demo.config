@@ -1221,6 +1221,26 @@ def getRootDependencyRefs(def bom, def rootRef, def directRefs) {
     return graphRoots ?: normalizeList(directRefs).findAll { it != rootRef }.unique()
 }
 
+boolean hasSameComponentIdentity(def component, def expectedComponent) {
+    if (!(component instanceof Map) || !(expectedComponent instanceof Map)) return false
+
+    def componentPurl = component.purl?.toString()?.trim()
+    def expectedPurl = expectedComponent.purl?.toString()?.trim()
+    if (componentPurl && expectedPurl && componentPurl == expectedPurl) return true
+
+    def componentName = component.name?.toString()?.trim()
+    def expectedName = expectedComponent.name?.toString()?.trim()
+    def componentVersion = component.version?.toString()?.trim()
+    def expectedVersion = expectedComponent.version?.toString()?.trim()
+    if (!componentName || !expectedName || !componentVersion || !expectedVersion) return false
+
+    def componentGroup = component.group?.toString()?.trim() ?: ""
+    def expectedGroup = expectedComponent.group?.toString()?.trim() ?: ""
+    return componentGroup == expectedGroup &&
+        componentName == expectedName &&
+        componentVersion == expectedVersion
+}
+
 def normalizeSbomForHierarchicalMerge(def sbomPath, def normalizedDir, int index) {
     def bom = readJSON(file: sbomPath)
 
@@ -1299,19 +1319,12 @@ void finalizeHierarchicalSbom(def sbomPath, def sbomTemplatePath) {
     bom.metadata = bom.metadata instanceof Map ? bom.metadata : [:]
     bom.metadata.component = rootComponent
 
-    def rootComponentRefs = [rootRef, "${rootRef}:${rootRef}"] as LinkedHashSet
+    def rootComponentRefs = [rootRef] as LinkedHashSet
     bom.components = normalizeList(bom.components).findAll { component ->
         if (!(component instanceof Map)) return true
 
         def componentRef = component["bom-ref"]?.toString()?.trim()
-        def sameRootIdentity = component.purl?.toString() == rootComponent.purl?.toString() ||
-            (
-                component.group?.toString() == rootComponent.group?.toString() &&
-                component.name?.toString() == rootComponent.name?.toString() &&
-                component.version?.toString() == rootComponent.version?.toString()
-            )
-
-        if (componentRef == rootRef || sameRootIdentity) {
+        if (componentRef == rootRef || hasSameComponentIdentity(component, rootComponent)) {
             if (componentRef) rootComponentRefs << componentRef
             return false
         }
