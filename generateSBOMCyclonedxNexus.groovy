@@ -1158,55 +1158,89 @@ def collectKnownBomRefs(def bom) {
     return refs
 }
 
-def makeDependencyState() {
-    return [
-        dependsOn: new LinkedHashSet(),
-        provides: new LinkedHashSet()
-    ]
+def getSbomSubjectName(def sbomPath) {
+    def path = sbomPath?.toString()
+    if (!path) return "sbom"
+
+    def slashIndex = path.lastIndexOf("/")
+    if (slashIndex > 0) {
+        return getPathTail(path.substring(0, slashIndex)) ?: getPathTail(path) ?: "sbom"
+    }
+    return getPathTail(path) ?: "sbom"
 }
 
-def makeDependencyObject(def ref, def state) {
-    def dependency = [
-        ref: ref,
-        dependsOn: state.dependsOn.findAll { it }.collect { it }
-    ]
-    if (state.provides) {
-        dependency.provides = state.provides.findAll { it }.collect { it }
+def ensureMetadataComponentForHierarchicalMerge(def bom, def sbomPath, def directRefs) {
+    bom.metadata = bom.metadata instanceof Map ? bom.metadata : [:]
+    def component = bom.metadata.component instanceof Map ? bom.metadata.component : null
+
+    if (component) {
+        def ref = component["bom-ref"]?.toString()?.trim()
+        if (!ref) ref = component.purl?.toString()?.trim()
+        if (!ref) {
+            def seed = "${sbomPath}:${directRefs.join('|')}:${component.group}:${component.name}:${component.version}"
+            ref = "generated-root-${sha256Text(seed).take(32)}"
+        }
+
+        component["bom-ref"] = ref
+        if (!component.type?.toString()?.trim()) component.type = "application"
+        if (!component.name?.toString()?.trim()) component.name = getSbomSubjectName(sbomPath)
+        if (!component.version?.toString()?.trim()) component.version = "0"
+        bom.metadata.component = component
+        return ref
     }
-    return dependency
+
+    if (!directRefs) return null
+
+    def syntheticRef = "generated-root-${sha256Text("${sbomPath}:${directRefs.join('|')}").take(32)}"
+    bom.metadata.component = [
+        type: "application",
+        "bom-ref": syntheticRef,
+        name: getSbomSubjectName(sbomPath),
+        version: "0"
+    ]
+    return syntheticRef
+}
+
+def getRootDependencyRefs(def bom, def rootRef, def directRefs) {
+    def dependencies = normalizeList(bom.dependencies).findAll { it instanceof Map }
+    def knownRefs = collectKnownBomRefs(bom)
+    def childRefs = new LinkedHashSet()
+
+    dependencies.each { dependency ->
+        dependencyRefList(dependency.dependsOn).each { childRef ->
+            if (childRef != rootRef) childRefs << childRef
+        }
+    }
+
+    def graphRoots = dependencies.collect { dependency ->
+        dependency.ref?.toString()?.trim()
+    }.findAll { ref ->
+        ref && ref != rootRef && knownRefs.contains(ref) && !childRefs.contains(ref)
+    }.unique()
+
+    return graphRoots ?: normalizeList(directRefs).findAll { it != rootRef }.unique()
 }
 
 def normalizeSbomForHierarchicalMerge(def sbomPath, def normalizedDir, int index) {
     def bom = readJSON(file: sbomPath)
-    if (bom.metadata?.component) return sbomPath
 
     def directRefs = ensureInventoryBomRefs(bom, sbomPath)
-    if (!directRefs) {
+    def rootRef = ensureMetadataComponentForHierarchicalMerge(bom, sbomPath, directRefs)
+    if (!rootRef) {
         echo("SBOM MERGE hierarchical skip: ${sbomPath}, reason=no metadata component and empty inventory")
         return null
     }
 
-    def syntheticRef = "generated-root-${sha256Text("${sbomPath}:${directRefs.join('|')}").take(32)}"
-    bom.metadata = bom.metadata instanceof Map ? bom.metadata : [:]
-    bom.metadata.component = [
-        type: "application",
-        "bom-ref": syntheticRef,
-        name: getPathTail(sbomPath) ?: "sbom",
-        version: "0"
-    ]
-
     def dependencies = normalizeList(bom.dependencies).findAll { it instanceof Map }
-    def rootDependency = dependencies.find { it.ref?.toString() == syntheticRef }
-    if (rootDependency) {
-        rootDependency.dependsOn = (dependencyRefList(rootDependency.dependsOn) + directRefs).unique()
-    } else {
-        dependencies = [[ref: syntheticRef, dependsOn: directRefs.unique()]] + dependencies
+    def hasRootDependency = dependencies.any { it.ref?.toString()?.trim() == rootRef }
+    if (!hasRootDependency) {
+        dependencies = [[ref: rootRef, dependsOn: getRootDependencyRefs(bom, rootRef, directRefs)]] + dependencies
     }
     bom.dependencies = dependencies
 
     def normalizedPath = "${normalizedDir}/normalized-${index}.json"
     writeJSON file: normalizedPath, json: bom
-    echo("SBOM MERGE hierarchical normalize: ${sbomPath} -> ${normalizedPath}, reason=synthetic metadata component")
+    echo("SBOM MERGE hierarchical normalize: ${sbomPath} -> ${normalizedPath}, reason=metadata/root dependency normalization")
     return normalizedPath
 }
 
@@ -1265,71 +1299,65 @@ void finalizeHierarchicalSbom(def sbomPath, def sbomTemplatePath) {
     bom.metadata = bom.metadata instanceof Map ? bom.metadata : [:]
     bom.metadata.component = rootComponent
 
+    def rootComponentRefs = [rootRef, "${rootRef}:${rootRef}"] as LinkedHashSet
     bom.components = normalizeList(bom.components).findAll { component ->
-        !(component instanceof Map && component["bom-ref"]?.toString() == rootRef)
+        if (!(component instanceof Map)) return true
+
+        def componentRef = component["bom-ref"]?.toString()?.trim()
+        def sameRootIdentity = component.purl?.toString() == rootComponent.purl?.toString() ||
+            (
+                component.group?.toString() == rootComponent.group?.toString() &&
+                component.name?.toString() == rootComponent.name?.toString() &&
+                component.version?.toString() == rootComponent.version?.toString()
+            )
+
+        if (componentRef == rootRef || sameRootIdentity) {
+            if (componentRef) rootComponentRefs << componentRef
+            return false
+        }
+
+        return true
     }
 
-    def knownRefs = collectKnownBomRefs(bom)
-    def dependencyStates = new LinkedHashMap()
-    def referencedAsChild = new LinkedHashSet()
+    def rootDependsOn = new LinkedHashSet()
+    def rootProvides = new LinkedHashSet()
+    def otherDependencies = []
+    def foundRootDependency = false
 
     normalizeList(bom.dependencies).findAll { it instanceof Map }.each { dependency ->
         def ref = dependency.ref?.toString()?.trim()
-        if (ref && (ref == rootRef || knownRefs.contains(ref))) {
-            def state = dependencyStates[ref] ?: makeDependencyState()
-            dependencyRefList(dependency.dependsOn).each { dependsOnRef ->
-                if (dependsOnRef != ref && (dependsOnRef == rootRef || knownRefs.contains(dependsOnRef))) {
-                    state.dependsOn << dependsOnRef
-                    if (ref != rootRef) referencedAsChild << dependsOnRef
-                }
-            }
-            dependencyRefList(dependency.provides).each { providesRef ->
-                if (providesRef != ref && (providesRef == rootRef || knownRefs.contains(providesRef))) {
-                    state.provides << providesRef
-                }
-            }
-            dependencyStates[ref] = state
+        if (ref == rootRef) {
+            foundRootDependency = true
+            dependencyRefList(dependency.dependsOn).findAll { !rootComponentRefs.contains(it) }.each { rootDependsOn << it }
+            dependencyRefList(dependency.provides).findAll { !rootComponentRefs.contains(it) }.each { rootProvides << it }
+        } else if (rootComponentRefs.contains(ref)) {
+            // This is the template component materialized by cyclonedx-cli; root metadata already represents it.
+        } else {
+            otherDependencies << dependency
         }
     }
 
-    def rootState = dependencyStates[rootRef] ?: makeDependencyState()
-    rootState.dependsOn.remove(rootRef)
-    if (!rootState.dependsOn && knownRefs) {
-        knownRefs.each { ref ->
-            if (!referencedAsChild.contains(ref)) rootState.dependsOn << ref
-        }
-    }
-    dependencyStates[rootRef] = rootState
-
-    knownRefs.each { ref ->
-        if (!dependencyStates.containsKey(ref)) dependencyStates[ref] = makeDependencyState()
+    def rootDependency = [ref: rootRef, dependsOn: rootDependsOn.collect { it }]
+    if (rootProvides) {
+        rootDependency.provides = rootProvides.collect { it }
     }
 
-    def dependencies = [makeDependencyObject(rootRef, dependencyStates[rootRef])]
-    dependencyStates.each { ref, state ->
-        if (ref != rootRef) dependencies << makeDependencyObject(ref, state)
-    }
-    bom.dependencies = dependencies
+    bom.dependencies = (foundRootDependency || otherDependencies) ?
+        ([rootDependency] + otherDependencies) :
+        [rootDependency]
 
     writeJSON file: sbomPath, json: bom
 }
 
-// hierarchical merge должен видеть каждый входной SBOM как отдельный subject, поэтому batch merge здесь не используется.
+// hierarchical merge должен видеть template и каждый входной SBOM как отдельные subjects; graph строит cyclonedx-cli.
 void mergeSbomFiles(def inputFiles, def mergedPath, def specVersion, def cyclonedxCliPath, def globals, boolean parallelMergeEnabled, def sbomTemplatePath) {
     def templateBom = readJSON(file: sbomTemplatePath)
     def rootComponent = templateBom.metadata?.component
     def files = prepareHierarchicalMergeInputs(inputFiles, globals)
+    def mergeFiles = ([sbomTemplatePath] + files.findAll { it != sbomTemplatePath }).unique()
 
-    if (!files) {
-        echo("SBOM MERGE hierarchical: inputs=0, action=root template only")
-        copyTextFile(sbomTemplatePath, mergedPath)
-        convertSbomFile(mergedPath, specVersion, cyclonedxCliPath)
-        finalizeHierarchicalSbom(mergedPath, sbomTemplatePath)
-        return
-    }
-
-    echo("SBOM MERGE hierarchical: files=${files.size()}, parallel_merge=${parallelMergeEnabled}, output=${mergedPath}")
-    mergeHierarchicalSbomFiles(files, mergedPath, cyclonedxCliPath, specVersion, rootComponent)
+    echo("SBOM MERGE hierarchical: files=${mergeFiles.size()}, parallel_merge=${parallelMergeEnabled}, output=${mergedPath}")
+    mergeHierarchicalSbomFiles(mergeFiles, mergedPath, cyclonedxCliPath, specVersion, rootComponent)
     finalizeHierarchicalSbom(mergedPath, sbomTemplatePath)
 }
 
