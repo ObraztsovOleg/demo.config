@@ -898,13 +898,16 @@ void copyTextFile(def sourcePath, def targetPath) {
 def isNonEmptySbom(def sbomPath) {
     if (!sbomPath || !fileExists(sbomPath)) return false
 
-    try {
-        def bom = readJSON(file: sbomPath)
-        return normalizeList(bom.components).size() > 0
-    } catch (err) {
-        echo("SBOM cache: файл ${sbomPath} не удалось прочитать как CycloneDX JSON: ${err}")
-        return false
+    // Проверяем кешевый BOM через jq, чтобы не загружать JSON в Jenkins/Groovy.
+    // jq -e возвращает 0 только если components является непустым массивом.
+    def status = sh(
+        script: "jq -e '(.components // []) | type == \"array\" and length > 0' ${shellQuote(sbomPath)} >/dev/null 2>&1",
+        returnStatus: true
+    )
+    if (status != 0) {
+        echo("SBOM cache: файл ${sbomPath} пустой или не читается как CycloneDX JSON")
     }
+    return status == 0
 }
 
 // Восстанавливает SBOM из Nexus, если объект существует и содержит components.
