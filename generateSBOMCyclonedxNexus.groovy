@@ -1,3 +1,4 @@
+// Метаданные расширения Jenkins: куда по умолчанию подключается шаг SBOM.
 def getDefaultConfig() {
     return [
             stage      : "pack",
@@ -6,6 +7,7 @@ def getDefaultConfig() {
     ]
 }
 
+// Приводит скалярное или списковое поле YAML к единому списку для дальнейшего объединения.
 def normalizeList(def value) {
     if (value == null) return []
     if (value instanceof List) return value
@@ -13,12 +15,14 @@ def normalizeList(def value) {
     return [value]
 }
 
+// Вспомогательный SHA-256 для ключей кеша и папок со сгенерированными артефактами.
 def sha256Text(def value) {
     def digest = java.security.MessageDigest.getInstance("SHA-256")
         .digest(value.toString().getBytes("UTF-8"))
     return digest.collect { String.format("%02x", ((int) it) & 0xff) }.join("")
 }
 
+// Приводит переменные окружения из словаря или списка KEY=VALUE к словарю.
 def envAssignmentsToMap(def value) {
     def result = [:]
     if (!value) return result
@@ -47,15 +51,23 @@ def envAssignmentsToMap(def value) {
     return result
 }
 
+// Преобразует итоговый словарь переменных окружения обратно в значения для Jenkins withEnv.
 def envMapToAssignments(def envMap) {
     if (!envMap) return []
     return envMap.collect { key, value -> "${key}=${value}" }
 }
 
+// Короткое имя проекта для логов; полные пути делают логи SBOM нечитаемыми.
 def getPathTail(def path) {
     return path?.toString()?.tokenize('/')?.last() ?: ""
 }
 
+// Экранирует путь для shell-команд, где список файлов собирается динамически.
+def shellQuote(def value) {
+    return "'${value.toString().replace("'", "'\"'\"'")}'"
+}
+
+// Сохраняет совместимость обертки инструментов и настроек NodeJS с исходным SBOM-скриптом.
 def wrapNodejs(def config, extension, def closure) {
     def result = closure
     def npmVersion = extension.npm?.version ?: config.npm?.version ?: "node-v20.12.2"
@@ -70,23 +82,23 @@ def wrapNodejs(def config, extension, def closure) {
     return result
 }
 
+// Используем Jenkins withMaven для Maven, JDK, настроек и локального репозитория, но выключаем неявные публикаторы отчетов.
+// Без publisherStrategy=EXPLICIT Pipeline Maven может запускать публикаторы JaCoCo во время вызовов mvn из cdxgen.
 def wrapMaven(def config, extension, def closure) {
     def result = closure
     def mavenHome = extension.maven?.home ?: config.maven?.home
     def jdk = extension.maven?.jdk ?: config.maven?.jdk ?: "openjdk-21"
+    def mavenSettingsConfig = extension.maven?.settings_id ?: config.maven?.settings_id
+    def mavenLocalRepo = extension.maven?.local_repo ?: '$workspace/.m2'
     if (config.maven || extension.maven) {
         result = {
-            def envEntries = []
-            if (mavenHome) {
-                def mavenTool = tool name: mavenHome
-                envEntries << "PATH+MAVEN=${mavenTool}/bin"
-            }
-            if (jdk) {
-                def jdkTool = tool name: jdk
-                envEntries << "JAVA_HOME=${jdkTool}"
-                envEntries << "PATH+JDK=${jdkTool}/bin"
-            }
-            withEnv(envEntries) {
+            withMaven(
+                maven: mavenHome,
+                jdk: jdk,
+                mavenSettingsConfig: mavenSettingsConfig,
+                mavenLocalRepo: mavenLocalRepo,
+                publisherStrategy: 'EXPLICIT'
+            ) {
                 closure()
             }
         }
@@ -94,6 +106,7 @@ def wrapMaven(def config, extension, def closure) {
     return result
 }
 
+// Отдаёт settings.xml как реальный файл, чтобы MVN_ARGS мог передать "-s <file>" в Maven, запущенный cdxgen.
 def wrapMavenSettingsFile(def mavenSettingsId, def closure) {
     if (!mavenSettingsId) return closure
 
@@ -104,16 +117,19 @@ def wrapMavenSettingsFile(def mavenSettingsId, def closure) {
     }
 }
 
+// Настройки Maven могут быть заданы глобально в pipeline.yml или прямо в расширении.
 def getMavenSettingsId(def config, def extension) {
     return extension.maven?.settings_id ?: config.maven?.settings_id
 }
 
+// Исключение директорий работает по префиксу, потому что исходные и сгенерированные корни передаются полными путями.
 def isExcludedDir(def path, def excludedDirs) {
     return normalizeList(excludedDirs).any { excluded ->
         path == excluded || path.startsWith("${excluded}/")
     }
 }
 
+// Собирает выражение prune для find(1), чтобы пропустить исходники, уже покрытые существующим SBOM или кешем.
 def findPruneExpression(def excludedDirs) {
     if (!excludedDirs) return ""
 
@@ -123,10 +139,13 @@ def findPruneExpression(def excludedDirs) {
     return "\\( ${expressions} \\) -prune -o"
 }
 
+// Сгенерированные корни анализа лежат внутри своего проекта, поэтому исключения уровня проекта покрывают их тоже.
 def getGeneratedAnalysisDir(def projectDir, def name) {
     return "${projectDir}/.sbom-cyclonedx/${name}"
 }
 
+// Пересобирает SDK *.pom файлы как Maven-проекты внутри корня проекта-владельца.
+// Пустые сгенерированные папки не возвращаются, чтобы cdxgen не сканировал бесполезные корни.
 def createSDKPomsFolder(def projectDirs, def excludedDirs = []) {
     def generatedDirs = []
 
@@ -154,6 +173,7 @@ def createSDKPomsFolder(def projectDirs, def excludedDirs = []) {
     return generatedDirs
 }
 
+// Записывает восстановленную Maven POM-иерархию из разобранных POM-моделей.
 void createPomHirarchy(def paths) {
     paths.each { info ->
         dir(info.dest) {
@@ -162,12 +182,14 @@ void createPomHirarchy(def paths) {
     }
 }
 
+// Преобразует разобранные POM-модели в пути назначения с восстановленной структурой родителя и модулей.
 def createPaths(def poms) {
     poms.collect { pomKey, pomInfo ->
         [pom: pomInfo.pom, dest: getDestPath(pomInfo, poms, pomKey)]
     }
 }
 
+// Идёт по связям parent POM, чтобы положить дочерние модули под восстановленного родителя.
 def getDestPath(def pomInfo, def poms, def pomKey) {
     def parent = poms[pomInfo.parent]
     def dest = pomInfo.dir
@@ -183,6 +205,7 @@ def getDestPath(def pomInfo, def poms, def pomKey) {
     return dest
 }
 
+// Распаковывает tgz-архивы внутри проекта-владельца, чтобы обычные исключения проекта покрывали извлеченное содержимое.
 def extractTgz(def projectDirs, def excludedDirs = []) {
     def generatedDirs = []
 
@@ -211,6 +234,7 @@ def extractTgz(def projectDirs, def excludedDirs = []) {
     return generatedDirs
 }
 
+// Разбирает исходные *.pom файлы и очищает существующие модули перед сборкой чистой иерархии.
 def getPoms(def pomPaths) {
     return pomPaths.collectEntries { path ->
         def pom = readMavenPom(file: path)
@@ -239,12 +263,24 @@ def getPoms(def pomPaths) {
     }
 }
 
+// cyclonedx-cli hierarchical merge строит ref корневого компонента как group.name@version.
+def getRootSbomBomRef(def gavtc, def code) {
+    def group = gavtc.groupId?.toString()?.trim()
+    def name = code?.toString()?.trim()
+    def version = gavtc.version?.toString()?.trim()
+    def base = group ? "${group}.${name}" : name
+    return "${base}@${version}"
+}
+
+// Базовый компонент приложения в конце объединяется со всеми отсканированными SBOM проектов.
 void generateSBOMTemplate(String sbomTemplatePath, def gavtc, def code) {
+    def rootBomRef = getRootSbomBomRef(gavtc, code)
     writeJSON file: sbomTemplatePath, json: [
         bomFormat: "CycloneDX",
         metadata: [
             component: [
                 type: "application",
+                "bom-ref": rootBomRef,
                 group: gavtc.groupId,
                 name: code,
                 version: gavtc.version,
@@ -256,6 +292,8 @@ void generateSBOMTemplate(String sbomTemplatePath, def gavtc, def code) {
     ]
 }
 
+// Собирает список корней, которые должен сканировать cdxgen.
+// Существующие исходные директории остаются основными; сгенерированные POM/TGZ корни добавляются только при наличии материала.
 def getProjectDirs(def globals, useNewVersion = null, def sourceDirs = null, def excludedDirs = []) {
     if (!fileExists(globals.DIR_SRC)) sh "mkdir -p ${globals.DIR_SRC}"
 
@@ -279,6 +317,7 @@ def getProjectDirs(def globals, useNewVersion = null, def sourceDirs = null, def
     return projectDirs.flatten().unique()
 }
 
+// Ищет уже существующие SBOM-файлы в исходных репозиториях; такие репозитории исключаются из нового сканирования.
 def getExcluded(def globals, def sbomPaths) {
     def srcDirs = getSourceDirs(globals)
     def scannedReposWithReportPaths = [:]
@@ -311,6 +350,7 @@ def getExcluded(def globals, def sbomPaths) {
     return scannedReposWithReportPaths
 }
 
+// Глобальный блок инструментов и переменных окружения для всех сканов; переопределения source применяются позже к каждой записи.
 def getTools(def extension) {
     def tools = [
         "CYCLONE=${tool name: extension.cdxgen ?: 'cdxgen-8.6.2'}",
@@ -329,10 +369,12 @@ def getTools(def extension) {
     return tools
 }
 
+// Переменные окружения расширения нормализуются один раз и затем объединяются с переменными конкретного source.
 def getEnvs(def extension) {
     return envMapToAssignments(envAssignmentsToMap(extension.env))
 }
 
+// Материал ключа кеша должен учитывать итоговое окружение скана, но не пути инструментов и не расположение бинарника cdxgen.
 def getScanBaseEnvMap(def tools, def envs) {
     def result = envAssignmentsToMap(normalizeList(tools) + normalizeList(envs))
     return result.findAll { key, _ ->
@@ -341,6 +383,7 @@ def getScanBaseEnvMap(def tools, def envs) {
     }
 }
 
+// Старым версиям cdxgen всё ещё нужны явно указанные корни Gradle-проектов.
 def getGradlePaths(def globals, def excludedDirs = []) {
     def prune = findPruneExpression(excludedDirs)
     return sh(
@@ -349,6 +392,7 @@ def getGradlePaths(def globals, def excludedDirs = []) {
     ).tokenize("\n")
 }
 
+// Репозитории верхнего уровня внутри DIR_SRC считаются независимо настраиваемыми source.
 def getSourceDirs(def globals) {
     if (!fileExists(globals.DIR_SRC)) return []
 
@@ -358,6 +402,7 @@ def getSourceDirs(def globals) {
     ).tokenize("\n")
 }
 
+// Пользовательские SBOM могут быть объединены в итоговый корневой SBOM.
 def findSbomMergePaths(def extension, def defaultSbomName, def globals) {
     def configDir = env.CONFIG_DIR ?: ""
     def sbomMergePaths = extension.sbom_merge_paths ?: []
@@ -400,6 +445,8 @@ def findSbomMergePaths(def extension, def defaultSbomName, def globals) {
     return paths
 }
 
+// Нормализует настройки кеша только до активных бекендов Nexus.
+// cache: [] намеренно означает "нет активного кеша".
 def normalizeCacheConfigs(def cache, def label = "cache") {
     def cacheItems
     if (cache == null) {
@@ -433,6 +480,7 @@ def normalizeCacheConfigs(def cache, def label = "cache") {
     }.findAll { it }
 }
 
+// Делает склейку URL/prefix предсказуемой независимо от начальных и конечных слешей в YAML.
 def trimSlashes(def value, boolean leading, boolean trailing) {
     def result = value?.toString() ?: ""
     if (leading) result = result.replaceFirst(/^\/+/, "")
@@ -440,11 +488,13 @@ def trimSlashes(def value, boolean leading, boolean trailing) {
     return result
 }
 
+// Группирует одинаковые настройки Nexus-кеша, чтобы временные директории переиспользовались на один бекенд.
 def cacheConfigKey(def cacheConfig) {
     if (!cacheConfig) return "none"
     return sha256Text(cacheConfig.collect { key, value -> "${key}=${value}" }.sort().join("\n"))
 }
 
+// Поиск переопределений source поддерживает и имя репозитория, и пути вложенных проектов.
 def getProjectSourceName(def globals, def projectDir) {
     if (projectDir?.startsWith("${globals.DIR_SRC}/")) {
         return projectDir.substring("${globals.DIR_SRC}/".length()).tokenize('/').first()
@@ -453,6 +503,7 @@ def getProjectSourceName(def globals, def projectDir) {
     return getPathTail(projectDir)
 }
 
+// Переопределения конкретного source могут менять args/env/tools и заменять или отключать кеш.
 def getSourceOverrides(def extension) {
     def sources = extension.sources
     if (!sources) return []
@@ -483,6 +534,7 @@ def getSourceOverrides(def extension) {
     }.findAll { it }
 }
 
+// Сопоставляет переопределения по абсолютному пути, пути относительно DIR_SRC, имени конечной папки или первому сегменту source.
 def findSourceOverride(def globals, def sourceOverrides, def projectDir) {
     if (!sourceOverrides) return null
 
@@ -503,6 +555,7 @@ def findSourceOverride(def globals, def sourceOverrides, def projectDir) {
     }
 }
 
+// Tools конкретного source добавляются в PATH только для записей, относящихся к этому source.
 def getSourceToolEnvs(def sourceOverride) {
     def result = []
     normalizeList(sourceOverride?.tools).eachWithIndex { toolName, index ->
@@ -513,11 +566,13 @@ def getSourceToolEnvs(def sourceOverride) {
     return result
 }
 
+// Кеш source работает как полная замена, а не merge: если есть sources[].cache, глобальный кеш игнорируется.
 def getEffectiveCacheConfig(def sourceOverride, def globalCacheConfigs) {
     def cacheConfigs = sourceOverride?.hasCache ? sourceOverride.cacheConfigs : globalCacheConfigs
     return normalizeList(cacheConfigs).find { it }
 }
 
+// Итоговая конфигурация скана проекта после объединения глобальных значений расширения и переопределения source.
 def getScanConfig(def globals, def sourceOverrides, def globalCacheConfigs, def baseArgs, def baseEnvMap, def projectDir) {
     def sourceOverride = findSourceOverride(globals, sourceOverrides, projectDir)
     return [
@@ -528,6 +583,7 @@ def getScanConfig(def globals, def sourceOverrides, def globalCacheConfigs, def 
     ]
 }
 
+// Разделяет type-аргументы cdxgen, чтобы сканы манифестов кешировались, а сканы артефактов оставались без кеша.
 def getScanTypeInfo(def args) {
     def tokens = normalizeList(args)
     def scanTypes = []
@@ -559,6 +615,7 @@ def getScanTypeInfo(def args) {
     ]
 }
 
+// Возвращает нормализованные аргументы "-t <type>" после разделения типов.
 def withCdxgenTypes(def cleanedArgs, def scanTypes) {
     def result = normalizeList(cleanedArgs).collect { it }
     normalizeList(scanTypes).each { scanType ->
@@ -567,6 +624,7 @@ def withCdxgenTypes(def cleanedArgs, def scanTypes) {
     return result
 }
 
+// Стабильный id для логов, путей SBOM и материала кеша; индексы не используются, чтобы ключи кеша не дрейфовали.
 def makeProjectId(def globals, def projectDir, def suffix = null) {
     def projectName = projectDir
     if (projectDir == globals.DIR_SRC) {
@@ -583,6 +641,7 @@ def makeProjectId(def globals, def projectDir, def suffix = null) {
     return suffix ? "${projectName}_${suffix}" : projectName
 }
 
+// Один проект может дать две независимые записи: кешируемый скан манифестов и некешируемый скан артефактов.
 def createScanEntries(def globals, def projectDir, def defaultSbomName, def scanConfig) {
     def typeInfo = getScanTypeInfo(scanConfig.args)
     def projectId = makeProjectId(globals, projectDir)
@@ -631,10 +690,12 @@ def createScanEntries(def globals, def projectDir, def defaultSbomName, def scan
     return entries
 }
 
+// Общая короткая метка для логов кеша и сканирования.
 def getEntryLogLabel(def entry) {
     return "project=${getPathTail(entry.projectDir)}, type=${entry.type}, id=${entry.projectId}, key=${entry.cacheKey ?: '-'}"
 }
 
+// Ключ кеша строится только по стабильным файлам манифестов и lock-файлам; бинарные артефакты намеренно исключены.
 def getCacheMaterial(def entry) {
     if (!entry?.projectDir || !fileExists(entry.projectDir)) return ""
 
@@ -649,6 +710,7 @@ def getCacheMaterial(def entry) {
         "Gemfile", "Gemfile.lock",
         "*.csproj", "*.fsproj", "*.vbproj", "packages.lock.json"
     ]
+    // Игнорируем директории сборки и кеша: их содержимое меняется между запусками и портит ключи кеша.
     def ignoredDirs = [".git", ".m2", "target", "build", ".gradle", "node_modules"] as Set
     if (!entry.projectDir.contains("/.sbom-cyclonedx/")) {
         ignoredDirs << ".sbom-cyclonedx"
@@ -672,6 +734,7 @@ def getCacheMaterial(def entry) {
     }.join("\n")
 }
 
+// Переменные окружения влияют на разрешение зависимостей, поэтому стабильные значения окружения входят в ключ кеша.
 def getEntryEnvMaterial(def entry) {
     def envMap = (entry.effectiveEnv ?: [:]).findAll { key, _ ->
         def keyText = key.toString()
@@ -680,6 +743,7 @@ def getEntryEnvMaterial(def entry) {
     return envMapToAssignments(envMap).sort().join("\n")
 }
 
+// Решает, можно ли кешировать запись, и готовит стабильный ключ объекта Nexus.
 def prepareCacheKey(def entry, def cdxgenVersion, def mavenSettingsId) {
     if (entry.artifactScan) {
         entry.cacheStatus = "skip"
@@ -709,12 +773,15 @@ def prepareCacheKey(def entry, def cdxgenVersion, def mavenSettingsId) {
     return true
 }
 
+// Maven-layout в Nexus требует, чтобы имя файла начиналось с artifactId-version.
+// Пример: sbom-cache/v1/sbom-cache-v1-<hash>.json.
 def getCacheObjectUrl(def cacheConfig, def entry) {
     if (!cacheConfig || !entry.cacheKey) return null
     def cacheFilePrefix = cacheConfig.prefix.toString().tokenize("/").join("-")
     return "${cacheConfig.url}/${cacheConfig.prefix}/${cacheFilePrefix}-${entry.cacheKey}.json"
 }
 
+// Временные файлы ответов GET/PUT изолированы для каждой настройки бекенда Nexus.
 def prepareCacheContext(def globals, def cacheConfig) {
     if (!cacheConfig) return null
 
@@ -723,6 +790,51 @@ def prepareCacheContext(def globals, def cacheConfig) {
     return cacheConfig + [dir: cacheDir]
 }
 
+// Готовит уникальные имена переменных окружения для credentials конкретного Nexus-бекенда.
+void prepareCacheCredentialVars(def cacheContext) {
+    if (!cacheContext?.creds || cacheContext.cacheUsernameVar) return
+
+    def suffix = cacheConfigKey(cacheContext).take(12).replaceAll(/[^A-Za-z0-9_]/, "_")
+    cacheContext.cacheUsernameVar = "SBOM_CACHE_USERNAME_${suffix}"
+    cacheContext.cachePasswordVar = "SBOM_CACHE_PASSWORD_${suffix}"
+}
+
+// Биндит Nexus credentials до запуска parallel, потому что local CIJE runner падает на withCredentials внутри веток.
+void runWithCacheCredentials(def cacheContexts, def closure) {
+    def bindings = []
+    def seen = [] as Set
+
+    normalizeList(cacheContexts).findAll { it?.creds }.each { cacheContext ->
+        prepareCacheCredentialVars(cacheContext)
+        def bindingKey = "${cacheContext.creds}:${cacheContext.cacheUsernameVar}:${cacheContext.cachePasswordVar}"
+        if (!seen.contains(bindingKey)) {
+            seen << bindingKey
+            bindings << usernamePassword(
+                credentialsId: cacheContext.creds,
+                usernameVariable: cacheContext.cacheUsernameVar,
+                passwordVariable: cacheContext.cachePasswordVar
+            )
+        }
+    }
+
+    if (!bindings) {
+        closure()
+        return
+    }
+
+    withCredentials(bindings) {
+        closure()
+    }
+}
+
+// Возвращает curl-аргумент авторизации из заранее привязанных переменных окружения.
+def getCacheCurlAuthArg(def cacheContext) {
+    if (!cacheContext?.creds) return ""
+    if (!cacheContext.cacheUsernameVar || !cacheContext.cachePasswordVar) return ""
+    return "-u \"\$${cacheContext.cacheUsernameVar}:\$${cacheContext.cachePasswordVar}\""
+}
+
+// Выполняет Nexus GET. Учетные данные уже привязаны снаружи, чтобы не дергать withCredentials в parallel.
 def runCacheGet(def cacheContext, def url, def outputPath) {
     def curlScript = { authArg ->
         return """
@@ -733,46 +845,24 @@ def runCacheGet(def cacheContext, def url, def outputPath) {
         """
     }
 
-    if (!cacheContext?.creds) {
-        return sh(script: curlScript(""), returnStdout: true)?.trim()
-    }
-
-    def response = null
-    withCredentials([usernamePassword(
-        credentialsId: cacheContext.creds,
-        usernameVariable: "SBOM_CACHE_USERNAME",
-        passwordVariable: "SBOM_CACHE_PASSWORD"
-    )]) {
-        response = sh(script: curlScript('-u "$SBOM_CACHE_USERNAME:$SBOM_CACHE_PASSWORD"'), returnStdout: true)
-    }
-    return response?.trim()
+    return sh(script: curlScript(getCacheCurlAuthArg(cacheContext)), returnStdout: true)?.trim()
 }
 
+// Выполняет Nexus PUT с семантикой загрузки, совместимой с Maven-репозиторием.
 def runCachePut(def cacheContext, def url, def sourcePath, def outputPath) {
     def curlScript = { authArg ->
         return """
             set +e
-            http_code=\$(curl -k -sS ${authArg} -X PUT --data-binary @"${sourcePath}" -w "%{http_code}" -o "${outputPath}" "${url}" 2>"${outputPath}.err")
+            http_code=\$(curl -k -sS ${authArg} -X PUT -T "${sourcePath}" -w "%{http_code}" -o "${outputPath}" "${url}" 2>"${outputPath}.err")
             curl_status=\$?
             echo "\${curl_status}:\${http_code}"
         """
     }
 
-    if (!cacheContext?.creds) {
-        return sh(script: curlScript(""), returnStdout: true)?.trim()
-    }
-
-    def response = null
-    withCredentials([usernamePassword(
-        credentialsId: cacheContext.creds,
-        usernameVariable: "SBOM_CACHE_USERNAME",
-        passwordVariable: "SBOM_CACHE_PASSWORD"
-    )]) {
-        response = sh(script: curlScript('-u "$SBOM_CACHE_USERNAME:$SBOM_CACHE_PASSWORD"'), returnStdout: true)
-    }
-    return response?.trim()
+    return sh(script: curlScript(getCacheCurlAuthArg(cacheContext)), returnStdout: true)?.trim()
 }
 
+// Curl печатает "<curl_status>:<http_code>"; null или пустой ответ считаем транспортной ошибкой.
 def parseCacheResponse(def text) {
     if (!text) {
         return [
@@ -788,6 +878,7 @@ def parseCacheResponse(def text) {
     ]
 }
 
+// Копирует через шаги Jenkins, а не через shell cp, чтобы работало и в Jenkins, и в локальном CIJE runner.
 void copyTextFile(def sourcePath, def targetPath) {
     def slashIndex = targetPath.lastIndexOf("/")
     if (slashIndex > 0) {
@@ -802,6 +893,7 @@ void copyTextFile(def sourcePath, def targetPath) {
     writeFile file: targetPath, text: readFile(file: sourcePath)
 }
 
+// В кеше полезны только SBOM с непустым списком components; пустые SBOM считаются промахом кеша.
 def isNonEmptySbom(def sbomPath) {
     if (!sbomPath || !fileExists(sbomPath)) return false
 
@@ -814,6 +906,8 @@ def isNonEmptySbom(def sbomPath) {
     }
 }
 
+// Восстанавливает SBOM из Nexus, если объект существует и содержит components.
+// Любая проблема кеша только помечает запись и даёт сценарию продолжить новый скан.
 def restoreFromCache(def cacheContext, def entry) {
     def url = getCacheObjectUrl(cacheContext, entry)
     if (!url) return false
@@ -848,9 +942,17 @@ def restoreFromCache(def cacheContext, def entry) {
     return true
 }
 
+// Сохраняет заново сгенерированный SBOM в Nexus.
+// PUT защищён предварительным GET, потому что Maven-репозитории hosted-типа часто отклоняют перезапись.
 def saveToCache(def cacheContext, def entry) {
-    if (!entry.cacheKey || entry.cacheStatus == "hit") {
+    if (!entry.cacheKey) {
         entry.cacheSaveStatus = "skip"
+        echo("SBOM cache SAVE SKIP: backend=${cacheContext.backend}, ${getEntryLogLabel(entry)}, reason=no cache key")
+        return false
+    }
+    if (entry.cacheStatus == "hit") {
+        entry.cacheSaveStatus = "skip"
+        echo("SBOM cache SAVE SKIP: backend=${cacheContext.backend}, ${getEntryLogLabel(entry)}, reason=already restored from cache")
         return false
     }
     if (!isNonEmptySbom(entry.sbomPath)) {
@@ -860,10 +962,33 @@ def saveToCache(def cacheContext, def entry) {
     }
 
     def url = getCacheObjectUrl(cacheContext, entry)
+    // Предварительная проверка предотвращает повторную загрузку, если кеш уже заполнил ранний запуск или другая ветка.
+    def existingPath = "${cacheContext.dir}/${entry.projectId}-${entry.cacheKey}.exists"
+    def existingResponse = parseCacheResponse(runCacheGet(cacheContext, url, existingPath))
+    if (existingResponse.curlStatus == 0 && existingResponse.httpCode == 200) {
+        entry.cacheSaveStatus = "skip"
+        echo("SBOM cache SAVE SKIP: backend=${cacheContext.backend}, ${getEntryLogLabel(entry)}, reason=already exists")
+        return false
+    }
+    if (existingResponse.curlStatus != 0 || existingResponse.httpCode != 404) {
+        entry.cacheSaveStatus = "failed"
+        unstable("SBOM cache SAVE CHECK FAILED: backend=${cacheContext.backend}, ${getEntryLogLabel(entry)}, http=${existingResponse.httpCode}, curl=${existingResponse.curlStatus}")
+        return false
+    }
+
     def outputPath = "${cacheContext.dir}/${entry.projectId}-${entry.cacheKey}.put"
     def response = parseCacheResponse(runCachePut(cacheContext, url, entry.sbomPath, outputPath))
 
     if (response.curlStatus != 0 || !(response.httpCode in [200, 201, 204])) {
+        // Если две ветки соревнуются, Nexus может отклонить один PUT, хотя объект уже доступен.
+        def afterPutPath = "${cacheContext.dir}/${entry.projectId}-${entry.cacheKey}.after-put"
+        def afterPutResponse = parseCacheResponse(runCacheGet(cacheContext, url, afterPutPath))
+        if (afterPutResponse.curlStatus == 0 && afterPutResponse.httpCode == 200) {
+            entry.cacheSaveStatus = "skip"
+            echo("SBOM cache SAVE SKIP: backend=${cacheContext.backend}, ${getEntryLogLabel(entry)}, reason=already exists after race")
+            return false
+        }
+
         entry.cacheSaveStatus = "failed"
         unstable("SBOM cache SAVE FAILED: backend=${cacheContext.backend}, ${getEntryLogLabel(entry)}, http=${response.httpCode}, curl=${response.curlStatus}")
         return false
@@ -874,10 +999,12 @@ def saveToCache(def cacheContext, def entry) {
     return true
 }
 
+// Версия cdxgen меняет поведение, поэтому входит в материал кеша скана манифестов.
 def getCdxgenVersion(def cdxgenPath) {
     return sh(script: "\${CYCLONE}/${cdxgenPath} --version 2>&1 || true", returnStdout: true).trim()
 }
 
+// Собирает окружение для одной записи скана, включая инструменты и переменные конкретного source.
 def scanEnvForEntry(def entry) {
     def result = normalizeList(entry.sourceTools) + envMapToAssignments(entry.effectiveEnv)
     if (env.MAVEN_SETTINGS_FILE) {
@@ -889,17 +1016,372 @@ def scanEnvForEntry(def entry) {
     return result
 }
 
+// Pipeline Maven plugin проверяет этот маркер перед публикацией сгенерированных отчетов покрытия.
+void writeMavenCoverageSkipMarker(def markerDir) {
+    if (!markerDir || !fileExists(markerDir)) return
+
+    dir(markerDir) {
+        writeFile file: ".skip-publish-coverage-results", text: ""
+    }
+}
+
+// Маркер проекта покрывает запуски Maven, которые cdxgen делает из директории проекта.
+void ensureMavenCoveragePublisherSkipped(def entry) {
+    writeMavenCoverageSkipMarker(entry?.projectDir)
+}
+
+// Маркер workspace покрывает запуски Maven, у которых build home резолвится в workspace Jenkins.
+void ensureWorkspaceMavenCoveragePublisherSkipped() {
+    writeMavenCoverageSkipMarker(env.WORKSPACE ?: pwd())
+}
+
+// Запускает cdxgen для одной записи. "-r" здесь не добавляется: рекурсия управляется аргументами пользователя.
 void runScan(def entry, def cdxgenPath, def extraExcludeDirs = []) {
     def scanArgs = normalizeList(entry.cdxgenArgs) + normalizeList(extraExcludeDirs).collectMany { dir ->
         ["--exclude", "\"${dir}/**\""]
     }
     entry.scanned = true
     echo("SBOM scan HOST: ${getEntryLogLabel(entry)}")
+    ensureMavenCoveragePublisherSkipped(entry)
     withEnv(scanEnvForEntry(entry)) {
         sh "\${CYCLONE}/${cdxgenPath} -o \"${entry.sbomPath}\" ${scanArgs.join(' ')} \"${entry.projectDir}\""
     }
 }
 
+// extension.parallel по умолчанию true; только явный false отключает Jenkins parallel.
+def isParallelEnabled(def extension) {
+    if (extension.parallel == null) return true
+    if (extension.parallel instanceof Boolean) return extension.parallel
+    return extension.parallel.toString().trim().toLowerCase() != "false"
+}
+
+// Параллельный merge включается только явно, чтобы не менять поведение старых конфигов.
+def isParallelMergeEnabled(def extension) {
+    if (extension.parallel_merge instanceof Boolean) return extension.parallel_merge
+    return extension.parallel_merge?.toString()?.trim()?.toLowerCase() == "true"
+}
+
+// Общий запускатель фаз. Сценарий записи сейчас использует его один раз с phaseName="ENTRY".
+void runEntriesPhase(def phaseName, def entries, boolean parallelEnabled, def closure) {
+    def phaseEntries = normalizeList(entries).findAll { it }
+    echo("SBOM ${phaseName} parallel: enabled=${parallelEnabled}, branches=${phaseEntries.size()}")
+    if (!phaseEntries) return
+
+    if (!parallelEnabled) {
+        phaseEntries.each { entry -> closure(entry) }
+        return
+    }
+
+    def branches = [failFast: false]
+    phaseEntries.eachWithIndex { entry, index ->
+        def phaseEntry = entry
+        def branchName = "SBOM ${phaseName} ${index} ${phaseEntry.projectId ?: getPathTail(phaseEntry.projectDir)}"
+        branches[branchName] = {
+            closure(phaseEntry)
+        }
+    }
+    parallel branches
+}
+
+void ensureParentDirectory(def filePath) {
+    def slashIndex = filePath.lastIndexOf("/")
+    if (slashIndex > 0) {
+        sh "mkdir -p ${shellQuote(filePath.substring(0, slashIndex))}"
+    }
+}
+
+def dependencyRefList(def value) {
+    return normalizeList(value).collect { it?.toString()?.trim() }.findAll { it }
+}
+
+def getComponentBomRef(def component, def seed, int index) {
+    if (!(component instanceof Map)) return null
+
+    def ref = component["bom-ref"]?.toString()?.trim()
+    if (!ref) ref = component.purl?.toString()?.trim()
+    if (!ref) {
+        def name = component.name?.toString()?.trim() ?: "component"
+        def version = component.version?.toString()?.trim() ?: "unknown"
+        ref = "generated-${sha256Text("${seed}:${index}:${component.type}:${component.group}:${name}:${version}").take(32)}"
+    }
+    component["bom-ref"] = ref
+
+    normalizeList(component.components).eachWithIndex { child, childIndex ->
+        getComponentBomRef(child, "${seed}:${index}", childIndex)
+    }
+    return ref
+}
+
+def getServiceBomRef(def service, def seed, int index) {
+    if (!(service instanceof Map)) return null
+
+    def ref = service["bom-ref"]?.toString()?.trim()
+    if (!ref) {
+        def name = service.name?.toString()?.trim() ?: "service"
+        ref = "generated-service-${sha256Text("${seed}:${index}:${name}").take(32)}"
+        service["bom-ref"] = ref
+    }
+    return ref
+}
+
+void collectComponentBomRefs(def components, def refs) {
+    normalizeList(components).findAll { it instanceof Map }.each { component ->
+        def ref = component["bom-ref"]?.toString()?.trim()
+        if (ref) refs << ref
+        collectComponentBomRefs(component.components, refs)
+    }
+}
+
+def ensureInventoryBomRefs(def bom, def seed) {
+    def directRefs = new LinkedHashSet()
+
+    normalizeList(bom.components).findAll { it instanceof Map }.eachWithIndex { component, index ->
+        def ref = getComponentBomRef(component, seed, index)
+        if (ref) directRefs << ref
+    }
+    normalizeList(bom.services).findAll { it instanceof Map }.eachWithIndex { service, index ->
+        def ref = getServiceBomRef(service, seed, index)
+        if (ref) directRefs << ref
+    }
+
+    return directRefs as List
+}
+
+def collectKnownBomRefs(def bom) {
+    def refs = new LinkedHashSet()
+    collectComponentBomRefs(bom.components, refs)
+    normalizeList(bom.services).findAll { it instanceof Map }.each { service ->
+        def ref = service["bom-ref"]?.toString()?.trim()
+        if (ref) refs << ref
+    }
+    return refs
+}
+
+def makeDependencyState() {
+    return [
+        dependsOn: new LinkedHashSet(),
+        provides: new LinkedHashSet()
+    ]
+}
+
+def makeDependencyObject(def ref, def state) {
+    def dependency = [
+        ref: ref,
+        dependsOn: state.dependsOn.findAll { it }.collect { it }
+    ]
+    if (state.provides) {
+        dependency.provides = state.provides.findAll { it }.collect { it }
+    }
+    return dependency
+}
+
+def normalizeSbomForHierarchicalMerge(def sbomPath, def normalizedDir, int index) {
+    def bom = readJSON(file: sbomPath)
+    if (bom.metadata?.component) return sbomPath
+
+    def directRefs = ensureInventoryBomRefs(bom, sbomPath)
+    if (!directRefs) {
+        echo("SBOM MERGE hierarchical skip: ${sbomPath}, reason=no metadata component and empty inventory")
+        return null
+    }
+
+    def syntheticRef = "generated-root-${sha256Text("${sbomPath}:${directRefs.join('|')}").take(32)}"
+    bom.metadata = bom.metadata instanceof Map ? bom.metadata : [:]
+    bom.metadata.component = [
+        type: "application",
+        "bom-ref": syntheticRef,
+        name: getPathTail(sbomPath) ?: "sbom",
+        version: "0"
+    ]
+
+    def dependencies = normalizeList(bom.dependencies).findAll { it instanceof Map }
+    def rootDependency = dependencies.find { it.ref?.toString() == syntheticRef }
+    if (rootDependency) {
+        rootDependency.dependsOn = (dependencyRefList(rootDependency.dependsOn) + directRefs).unique()
+    } else {
+        dependencies = [[ref: syntheticRef, dependsOn: directRefs.unique()]] + dependencies
+    }
+    bom.dependencies = dependencies
+
+    def normalizedPath = "${normalizedDir}/normalized-${index}.json"
+    writeJSON file: normalizedPath, json: bom
+    echo("SBOM MERGE hierarchical normalize: ${sbomPath} -> ${normalizedPath}, reason=synthetic metadata component")
+    return normalizedPath
+}
+
+def prepareHierarchicalMergeInputs(def inputFiles, def globals) {
+    def files = normalizeList(inputFiles).findAll { fileExists(it) }.unique()
+    if (!files) return []
+
+    def normalizedDir = "${globals.DIR_TMP}/generateSBOMCyclonedx-hierarchical-${UUID.randomUUID().toString()}"
+    sh "mkdir -p ${shellQuote(normalizedDir)}"
+
+    def result = []
+    files.eachWithIndex { sbomPath, index ->
+        def normalizedPath = normalizeSbomForHierarchicalMerge(sbomPath, normalizedDir, index)
+        if (normalizedPath) result << normalizedPath
+    }
+    return result.unique()
+}
+
+void mergeHierarchicalSbomFiles(def inputFiles, def outputPath, def cyclonedxCliPath, def specVersion, def rootComponent) {
+    ensureParentDirectory(outputPath)
+    sh """
+        \${CYClONE_CLI}/${cyclonedxCliPath} merge \
+            --input-files ${normalizeList(inputFiles).collect { shellQuote(it) }.join(' ')} \
+            --output-file ${shellQuote(outputPath)} \
+            --output-format json \
+            --output-version ${specVersion} \
+            --hierarchical \
+            --group ${shellQuote(rootComponent.group ?: '')} \
+            --name ${shellQuote(rootComponent.name)} \
+            --version ${shellQuote(rootComponent.version)}
+    """
+}
+
+// Финальная конвертация оставлена отдельным шагом, как в исходном сценарии.
+void convertSbomFile(def sbomPath, def specVersion, def cyclonedxCliPath) {
+    ensureParentDirectory(sbomPath)
+    sh """
+        \${CYClONE_CLI}/${cyclonedxCliPath} convert \
+            --output-version ${specVersion} \
+            --input-file ${shellQuote(sbomPath)} \
+            --output-file ${shellQuote(sbomPath)}
+    """
+}
+
+void finalizeHierarchicalSbom(def sbomPath, def sbomTemplatePath) {
+    def bom = readJSON(file: sbomPath)
+    def templateBom = readJSON(file: sbomTemplatePath)
+    def rootComponent = templateBom.metadata?.component
+    def rootRef = rootComponent?."bom-ref"?.toString()?.trim()
+
+    if (!rootComponent || !rootRef) {
+        unstable("SBOM hierarchical finalize: root metadata component is missing in ${sbomTemplatePath}")
+        return
+    }
+
+    bom.metadata = bom.metadata instanceof Map ? bom.metadata : [:]
+    bom.metadata.component = rootComponent
+
+    bom.components = normalizeList(bom.components).findAll { component ->
+        !(component instanceof Map && component["bom-ref"]?.toString() == rootRef)
+    }
+
+    def knownRefs = collectKnownBomRefs(bom)
+    def dependencyStates = new LinkedHashMap()
+    def referencedAsChild = new LinkedHashSet()
+
+    normalizeList(bom.dependencies).findAll { it instanceof Map }.each { dependency ->
+        def ref = dependency.ref?.toString()?.trim()
+        if (ref && (ref == rootRef || knownRefs.contains(ref))) {
+            def state = dependencyStates[ref] ?: makeDependencyState()
+            dependencyRefList(dependency.dependsOn).each { dependsOnRef ->
+                if (dependsOnRef != ref && (dependsOnRef == rootRef || knownRefs.contains(dependsOnRef))) {
+                    state.dependsOn << dependsOnRef
+                    if (ref != rootRef) referencedAsChild << dependsOnRef
+                }
+            }
+            dependencyRefList(dependency.provides).each { providesRef ->
+                if (providesRef != ref && (providesRef == rootRef || knownRefs.contains(providesRef))) {
+                    state.provides << providesRef
+                }
+            }
+            dependencyStates[ref] = state
+        }
+    }
+
+    def rootState = dependencyStates[rootRef] ?: makeDependencyState()
+    rootState.dependsOn.remove(rootRef)
+    if (!rootState.dependsOn && knownRefs) {
+        knownRefs.each { ref ->
+            if (!referencedAsChild.contains(ref)) rootState.dependsOn << ref
+        }
+    }
+    dependencyStates[rootRef] = rootState
+
+    knownRefs.each { ref ->
+        if (!dependencyStates.containsKey(ref)) dependencyStates[ref] = makeDependencyState()
+    }
+
+    def dependencies = [makeDependencyObject(rootRef, dependencyStates[rootRef])]
+    dependencyStates.each { ref, state ->
+        if (ref != rootRef) dependencies << makeDependencyObject(ref, state)
+    }
+    bom.dependencies = dependencies
+
+    writeJSON file: sbomPath, json: bom
+}
+
+// hierarchical merge должен видеть каждый входной SBOM как отдельный subject, поэтому batch merge здесь не используется.
+void mergeSbomFiles(def inputFiles, def mergedPath, def specVersion, def cyclonedxCliPath, def globals, boolean parallelMergeEnabled, def sbomTemplatePath) {
+    def templateBom = readJSON(file: sbomTemplatePath)
+    def rootComponent = templateBom.metadata?.component
+    def files = prepareHierarchicalMergeInputs(inputFiles, globals)
+
+    if (!files) {
+        echo("SBOM MERGE hierarchical: inputs=0, action=root template only")
+        copyTextFile(sbomTemplatePath, mergedPath)
+        convertSbomFile(mergedPath, specVersion, cyclonedxCliPath)
+        finalizeHierarchicalSbom(mergedPath, sbomTemplatePath)
+        return
+    }
+
+    echo("SBOM MERGE hierarchical: files=${files.size()}, parallel_merge=${parallelMergeEnabled}, output=${mergedPath}")
+    mergeHierarchicalSbomFiles(files, mergedPath, cyclonedxCliPath, specVersion, rootComponent)
+    finalizeHierarchicalSbom(mergedPath, sbomTemplatePath)
+}
+
+// Родительские и корневые сканы исключают запланированные дочерние директории, чтобы не сканировать один source дважды.
+def getEntryPlannedExcludeDirs(def entry, def plannedDirs) {
+    normalizeList(plannedDirs).findAll { plannedDir ->
+        plannedDir != entry.projectDir && plannedDir.startsWith("${entry.projectDir}/")
+    }.unique()
+}
+
+// Помечает дублирующиеся URL кеша до параллельного выполнения, чтобы только одна ветка пыталась делать PUT.
+void markDuplicateCacheSaveEntries(def entries) {
+    def seenUrls = [] as Set
+    normalizeList(entries).findAll { it.cacheKey && it.cacheContext }.each { entry ->
+        def url = getCacheObjectUrl(entry.cacheContext, entry)
+        if (url && seenUrls.contains(url)) {
+            entry.skipCacheSave = true
+        }
+        if (url) {
+            seenUrls << url
+        }
+    }
+}
+
+// Независимая единица работы: восстановить кеш, при необходимости просканировать, затем сохранить свежий непустой результат.
+void runScanEntryWorkflow(def entry, def cdxgenPath, def excludeDirs = []) {
+    if (entry.cacheKey && entry.cacheContext) {
+        restoreFromCache(entry.cacheContext, entry)
+    }
+
+    if (entry.cacheStatus == "hit") {
+        entry.cacheSaveStatus = "skip"
+        echo("SBOM cache SAVE SKIP: backend=${entry.cacheContext.backend}, ${getEntryLogLabel(entry)}, reason=already restored from cache")
+        return
+    }
+
+    if (!fileExists(entry.sbomPath)) {
+        runScan(entry, cdxgenPath, excludeDirs)
+    } else {
+        echo("SBOM scan HOST SKIP: ${getEntryLogLabel(entry)}, reason=sbom already exists")
+    }
+
+    if (entry.cacheKey && entry.cacheContext) {
+        if (entry.skipCacheSave) {
+            entry.cacheSaveStatus = "skip"
+            echo("SBOM cache SAVE SKIP: backend=${entry.cacheContext.backend}, ${getEntryLogLabel(entry)}, reason=duplicate cache key in run")
+            return
+        }
+        saveToCache(entry.cacheContext, entry)
+    }
+}
+
+// Главная точка входа pipeline: найти проекты, выполнить сценарии записей, объединить SBOM и прикрепить артефакт.
 void run(def extension, def extensionAPI) {
     def distrib = extensionAPI.distrib
     def globals = distrib.globals
@@ -935,8 +1417,11 @@ void run(def extension, def extensionAPI) {
             def globalCacheConfigs = normalizeCacheConfigs(extension.cache)
             def baseEnvMap = getScanBaseEnvMap(tools, envs)
             def scannedSbomPaths = []
+            def parallelEnabled = isParallelEnabled(extension)
+            def parallelMergeEnabled = isParallelMergeEnabled(extension)
 
             if (useNewVersion) {
+                // Новые версии cdxgen умеют исключать репозитории со своим SBOM и не должны сканировать workspace .m2.
                 excludedSbomMap = getExcluded(globals, sbomNames)
                 scannedSbomPaths = excludedSbomMap.collect { _, fullPath -> fullPath }
                 def excludePatterns = excludedSbomMap.collect { dir, _ -> "\"${dir}/**\"" }
@@ -950,6 +1435,7 @@ void run(def extension, def extensionAPI) {
                 cdxgenArgs.add("\"**/.m2/**\"")
             }
 
+            // Поиск проектов также создаёт сгенерированные корни анализа внутри каждого активного проекта.
             def excludedDirs = excludedSbomMap.keySet() as List
             def projectDirs = getProjectDirs(globals, useNewVersion, sourceDirs, excludedDirs)
             def cacheContexts = [:]
@@ -958,6 +1444,7 @@ void run(def extension, def extensionAPI) {
                 createScanEntries(globals, projectDir, defaultSbomName, scanConfig)
             }
 
+            // Ключи кеша готовятся до параллельного выполнения, чтобы можно было найти дублирующиеся URL.
             projectEntries.each { entry ->
                 if (entry.projectDir == globals.DIR_SRC) {
                     entry.cacheConfig = null
@@ -966,60 +1453,52 @@ void run(def extension, def extensionAPI) {
                     def contextKey = cacheConfigKey(entry.cacheConfig)
                     cacheContexts[contextKey] = cacheContexts[contextKey] ?: prepareCacheContext(globals, entry.cacheConfig)
                     entry.cacheContext = cacheContexts[contextKey]
-                    restoreFromCache(entry.cacheContext, entry)
+                }
+            }
+            markDuplicateCacheSaveEntries(projectEntries)
+
+            // Запланированные дочерние директории исключаются из родительских сканов, чтобы избежать повторного рекурсивного анализа.
+            def plannedDirs = projectEntries.collect { it.projectDir }.unique()
+            if (projectEntries) {
+                ensureWorkspaceMavenCoveragePublisherSkipped()
+            }
+
+            // Каждая ветка теперь выполняет полный цикл: восстановление из Nexus -> скан cdxgen -> сохранение в Nexus.
+            runWithCacheCredentials(cacheContexts.values()) {
+                runEntriesPhase("ENTRY", projectEntries, parallelEnabled) { entry ->
+                    runScanEntryWorkflow(entry, cdxgenPath, getEntryPlannedExcludeDirs(entry, plannedDirs))
                 }
             }
 
-            def cacheHitDirs = projectEntries.findAll { it.cacheStatus == "hit" && it.projectDir != globals.DIR_SRC }
-                .collect { it.projectDir }
-                .unique()
-
-            def entriesToScan = projectEntries.findAll { entry ->
-                !fileExists(entry.sbomPath) &&
-                    (entry.artifactScan ||
-                        !cacheHitDirs.any { hitDir -> entry.projectDir == hitDir || entry.projectDir.startsWith("${hitDir}/") })
-            }
-
-            entriesToScan.each { entry ->
-                runScan(entry, cdxgenPath, cacheHitDirs)
-            }
-
-            projectEntries.findAll { it.cacheKey && it.cacheContext }.each { entry ->
-                saveToCache(entry.cacheContext, entry)
-            }
-
+            // В merge попадают только файлы, реально появившиеся после восстановления из кеша или нового скана.
             projectEntries.each { entry ->
                 if (fileExists(entry.sbomPath)) scannedSbomPaths << entry.sbomPath
             }
 
-            def allSboms = ([sbomTemplatePath] + sbomMergePaths.exists + scannedSbomPaths).unique()
+            def allSboms = (sbomMergePaths.exists + scannedSbomPaths).unique()
 
             if (useNewVersion) {
                 allSboms = (allSboms + excludedSbomMap.values()).unique()
             }
 
+            // Итог намеренно короткий и стабильный, чтобы в логах Jenkins быстро видеть пользу кеша.
             def cacheableEntries = projectEntries.findAll { it.cacheKey }
             def cacheHits = cacheableEntries.count { it.cacheStatus == "hit" }
             def cacheMisses = cacheableEntries.count { it.cacheStatus == "miss" }
             def cacheUnavailable = cacheableEntries.count { it.cacheStatus == "unavailable" }
             def cacheSaves = cacheableEntries.count { it.cacheSaveStatus == "saved" }
+            def cacheSaveSkips = cacheableEntries.count { it.cacheSaveStatus == "skip" }
+            def cacheSaveFailed = cacheableEntries.count { it.cacheSaveStatus == "failed" }
             def cacheSkips = projectEntries.count { it.cacheStatus == "skip" }
             def hostScans = projectEntries.count { it.scanned }
             echo("SBOM summary: cache hits=${cacheHits}, misses=${cacheMisses}, unavailable=${cacheUnavailable}, " +
-                "skips=${cacheSkips}, saves=${cacheSaves}; Host scans=${hostScans}; merge files=${allSboms.size()}")
+                "skips=${cacheSkips}, saves=${cacheSaves}, save skips=${cacheSaveSkips}, " +
+                "save failed=${cacheSaveFailed}; Host scans=${hostScans}; merge files=${allSboms.size()}")
 
             def mergedPath = "${globals.DIR_SRC}/${defaultSbomName}"
-            sh """
-                \${CYClONE_CLI}/${cyclonedxCliPath} merge \
-                    --input-files ${allSboms.join(' ')} \
-                    --output-file ${mergedPath}
-                \${CYClONE_CLI}/${cyclonedxCliPath} convert \
-                    --output-version ${specVersion} \
-                    --input-file ${mergedPath} \
-                    --output-file ${mergedPath}
-            """
+            mergeSbomFiles(allSboms, mergedPath, specVersion, cyclonedxCliPath, globals, parallelMergeEnabled, sbomTemplatePath)
 
-            echo("Следующие SBOM файлы ${allSboms.join(' ')} успешно объединены со сгенерированным SBOM ${mergedPath}")
+            echo("SBOM файлы успешно объединены: files=${allSboms.size()}, output=${mergedPath}")
             if (sbomMergePaths.notExists) {
                 unstable("Следующие SBOM файлы ${sbomMergePaths.notExists.join(' ')} " +
                     "не найдены. Проверьте корректность заполнения параметра sbom_merge_paths")
@@ -1042,6 +1521,7 @@ void run(def extension, def extensionAPI) {
     runner()
 }
 
+// Простой семантический компаратор версий для проверок доступности возможностей cdxgen.
 def versionAtLeast(def current, def required) {
     def result = (0..<required.size()).findResult { index ->
         int actual = index < current.size() ? current[index] : 0
@@ -1051,6 +1531,7 @@ def versionAtLeast(def current, def required) {
     return result == null ? true : result
 }
 
+// Поведение cdxgen изменилось в 9.9.3; новые версии поддерживают используемый выше сценарий исключения SBOM.
 def isNewVersion(def cdxgenPath) {
     def versionOutput = sh(
             script: "\${CYCLONE}/${cdxgenPath} --version",
