@@ -101,6 +101,8 @@ extensions:
     cyclonedx_cli: cyclonedx-cli-0.32.0
     cyclonedx_cli_path: cyclonedx
     parallel: false
+    env:
+      FETCH_LICENSE: "true"
     args:
       - "-t java"
       - "-t jar"
