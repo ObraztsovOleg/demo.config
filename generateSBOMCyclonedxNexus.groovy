@@ -1239,6 +1239,14 @@ void normalizeSbomJsonShape(def sbomPath, def normalizedPath, def subjectName, d
         def text:
           if . == null then "" else tostring end;
 
+        def first_non_empty($first; $second; $fallback):
+          ($first | text) as $a
+          | ($second | text) as $b
+          | ($fallback | text) as $c
+          | if ($a | length) > 0 then $a
+            elif ($b | length) > 0 then $b
+            else $c end;
+
         def generated_ref($prefix; $seed):
           $prefix + ($seed | @uri);
 
@@ -1249,7 +1257,7 @@ void normalizeSbomJsonShape(def sbomPath, def normalizedPath, def subjectName, d
             | (.version // "unknown" | text) as $version
             | (.type // "" | text) as $type
             | (.group // "" | text) as $group
-            | .["bom-ref"] = ((.["bom-ref"] // .purl // generated_ref("generated-"; [$seed, $type, $group, $name, $version] | join(":"))) | text)
+            | .["bom-ref"] = first_non_empty(.["bom-ref"]; .purl; generated_ref("generated-"; [$seed, $type, $group, $name, $version] | join(":")))
             | .components = ((.components | as_array) | to_entries | map(. as $entry | $entry.value | normalize_component($seed + ":" + ($entry.key | tostring))))
           end;
 
@@ -1257,7 +1265,7 @@ void normalizeSbomJsonShape(def sbomPath, def normalizedPath, def subjectName, d
           if type != "object" then .
           else
             (.name // "service" | text) as $name
-            | .["bom-ref"] = ((.["bom-ref"] // generated_ref("generated-service-"; [$seed, $name] | join(":"))) | text)
+            | .["bom-ref"] = first_non_empty(.["bom-ref"]; null; generated_ref("generated-service-"; [$seed, $name] | join(":")))
           end;
 
         def direct_refs:
@@ -1272,7 +1280,7 @@ void normalizeSbomJsonShape(def sbomPath, def normalizedPath, def subjectName, d
         | .services = ((.services | as_array) | to_entries | map(. as $entry | $entry.value | normalize_service("service:" + ($entry.key | tostring))))
         | if (.metadata.component | type) == "object" then
             .metadata.component |= (
-              .["bom-ref"] = ((.["bom-ref"] // .purl // $syntheticRootRef) | text)
+              .["bom-ref"] = first_non_empty(.["bom-ref"]; .purl; $syntheticRootRef)
               | if ((.type // "" | text) == "") then .type = "application" else . end
               | if ((.name // "" | text) == "") then .name = $subjectName else . end
               | if ((.version // "" | text) == "") then .version = "0" else . end
@@ -1544,7 +1552,7 @@ void finalizeHierarchicalSbom(def sbomPath, def sbomTemplatePath) {
         ($root[0]["bom-ref"] | tostring) as $rootRef
         | ($rootRefs[0]) as $refs
         | (.dependencies | as_array | map(select(type == "object"))) as $deps
-        | [$deps[] | select((.ref // "" | tostring) == $rootRef)] as $rootDeps
+        | [$deps[] | (.ref // "" | tostring) as $ref | select(($refs | index($ref)) != null)] as $rootDeps
         | ([$rootDeps[] | (.dependsOn | as_array)[]? | tostring | . as $ref | select(($refs | index($ref)) == null)] | unique) as $rootDependsOn
         | ([$rootDeps[] | (.provides | as_array)[]? | tostring | . as $ref | select(($refs | index($ref)) == null)] | unique) as $rootProvides
         | ({ref: $rootRef, dependsOn: $rootDependsOn} + if ($rootProvides | length) > 0 then {provides: $rootProvides} else {} end) as $rootDependency
