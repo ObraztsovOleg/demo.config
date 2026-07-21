@@ -1108,8 +1108,18 @@ def getSbomSubjectName(def sbomPath) {
 }
 
 void writeJsonArrayFile(def filePath, def values) {
+    writeTextFile(filePath, groovy.json.JsonOutput.toJson(normalizeList(values)))
+}
+
+void writeTextFile(def filePath, def text) {
     ensureParentDirectory(filePath)
-    writeFile file: filePath, text: groovy.json.JsonOutput.toJson(normalizeList(values))
+    writeFile file: filePath, text: text.toString()
+}
+
+void writeJqFilterFile(def filePath, def filterText) {
+    // jq-фильтр маленький, поэтому его безопасно писать через Jenkins writeFile.
+    // Большой SBOM при этом остается во внешнем jq-процессе и не попадает в память Groovy.
+    writeTextFile(filePath, filterText.toString().stripIndent().trim() + "\n")
 }
 
 def parseSbomGraphInfo(def graphText) {
@@ -1211,140 +1221,162 @@ def getPreparedDependencyGraph(def info) {
 }
 
 void normalizeSbomJsonShape(def sbomPath, def normalizedPath, def subjectName, def syntheticRootRef) {
-    def normalizeShapeFilter = [
-        'def as_array:',
-        '  if . == null then []',
-        '  elif type == "array" then .',
-        '  elif type == "object" then [.]',
-        '  else [] end;',
-        '',
-        'def as_object:',
-        '  if type == "object" then . else {} end;',
-        '',
-        'def text:',
-        '  if . == null then "" else tostring end;',
-        '',
-        'def generated_ref($prefix; $seed):',
-        '  $prefix + ($seed | @uri);',
-        '',
-        'def normalize_component($seed):',
-        '  if type != "object" then .',
-        '  else',
-        '    (.name // "component" | text) as $name',
-        '    | (.version // "unknown" | text) as $version',
-        '    | (.type // "" | text) as $type',
-        '    | (.group // "" | text) as $group',
-        '    | .["bom-ref"] = ((.["bom-ref"] // .purl // generated_ref("generated-"; [$seed, $type, $group, $name, $version] | join(":"))) | text)',
-        '    | .components = ((.components | as_array) | to_entries | map(. as $entry | $entry.value | normalize_component($seed + ":" + ($entry.key | tostring))))',
-        '  end;',
-        '',
-        'def normalize_service($seed):',
-        '  if type != "object" then .',
-        '  else',
-        '    (.name // "service" | text) as $name',
-        '    | .["bom-ref"] = ((.["bom-ref"] // generated_ref("generated-service-"; [$seed, $name] | join(":"))) | text)',
-        '  end;',
-        '',
-        'def direct_refs:',
-        '  [',
-        '    ((.components | as_array)[]? | select(type == "object") | .["bom-ref"]),',
-        '    ((.services | as_array)[]? | select(type == "object") | .["bom-ref"])',
-        '  ]',
-        '  | map(select(. != null and (tostring | length > 0)) | tostring);',
-        '',
-        '.metadata = ((.metadata // {}) | as_object)',
-        '| .components = ((.components | as_array) | to_entries | map(. as $entry | $entry.value | normalize_component("component:" + ($entry.key | tostring))))',
-        '| .services = ((.services | as_array) | to_entries | map(. as $entry | $entry.value | normalize_service("service:" + ($entry.key | tostring))))',
-        '| if (.metadata.component | type) == "object" then',
-        '    .metadata.component |= (',
-        '      .["bom-ref"] = ((.["bom-ref"] // .purl // $syntheticRootRef) | text)',
-        '      | if ((.type // "" | text) == "") then .type = "application" else . end',
-        '      | if ((.name // "" | text) == "") then .name = $subjectName else . end',
-        '      | if ((.version // "" | text) == "") then .version = "0" else . end',
-        '    )',
-        '  elif ((direct_refs | length) > 0) then',
-        '    .metadata.component = {',
-        '      type: "application",',
-        '      "bom-ref": $syntheticRootRef,',
-        '      name: $subjectName,',
-        '      version: "0"',
-        '    }',
-        '  else',
-        '    .',
-        '  end'
-    ].join("\n")
+    def normalizeShapeFilter = '''
+        def as_array:
+          if . == null then []
+          elif type == "array" then .
+          elif type == "object" then [.]
+          else [] end;
+
+        def as_object:
+          if type == "object" then . else {} end;
+
+        def text:
+          if . == null then "" else tostring end;
+
+        def generated_ref($prefix; $seed):
+          $prefix + ($seed | @uri);
+
+        def normalize_component($seed):
+          if type != "object" then .
+          else
+            (.name // "component" | text) as $name
+            | (.version // "unknown" | text) as $version
+            | (.type // "" | text) as $type
+            | (.group // "" | text) as $group
+            | .["bom-ref"] = ((.["bom-ref"] // .purl // generated_ref("generated-"; [$seed, $type, $group, $name, $version] | join(":"))) | text)
+            | .components = ((.components | as_array) | to_entries | map(. as $entry | $entry.value | normalize_component($seed + ":" + ($entry.key | tostring))))
+          end;
+
+        def normalize_service($seed):
+          if type != "object" then .
+          else
+            (.name // "service" | text) as $name
+            | .["bom-ref"] = ((.["bom-ref"] // generated_ref("generated-service-"; [$seed, $name] | join(":"))) | text)
+          end;
+
+        def direct_refs:
+          [
+            ((.components | as_array)[]? | select(type == "object") | .["bom-ref"]),
+            ((.services | as_array)[]? | select(type == "object") | .["bom-ref"])
+          ]
+          | map(select(. != null and (tostring | length > 0)) | tostring);
+
+        .metadata = ((.metadata // {}) | as_object)
+        | .components = ((.components | as_array) | to_entries | map(. as $entry | $entry.value | normalize_component("component:" + ($entry.key | tostring))))
+        | .services = ((.services | as_array) | to_entries | map(. as $entry | $entry.value | normalize_service("service:" + ($entry.key | tostring))))
+        | if (.metadata.component | type) == "object" then
+            .metadata.component |= (
+              .["bom-ref"] = ((.["bom-ref"] // .purl // $syntheticRootRef) | text)
+              | if ((.type // "" | text) == "") then .type = "application" else . end
+              | if ((.name // "" | text) == "") then .name = $subjectName else . end
+              | if ((.version // "" | text) == "") then .version = "0" else . end
+            )
+          elif ((direct_refs | length) > 0) then
+            .metadata.component = {
+              type: "application",
+              "bom-ref": $syntheticRootRef,
+              name: $subjectName,
+              version: "0"
+            }
+          else
+            .
+          end
+    '''
+    def filterPath = "${normalizedPath}.normalize-shape-${UUID.randomUUID().toString()}.jq"
+    writeJqFilterFile(filterPath, normalizeShapeFilter)
 
     // jq нормализует форму большого BOM во внешнем процессе: Groovy не читает весь JSON.
+    // Фильтр передаем через файл, чтобы Jenkins-log не печатал длинный jq-код inline.
     sh """
+        set -e
         command -v jq >/dev/null 2>&1 || { echo 'SBOM hierarchical normalize requires jq'; exit 1; }
-        jq --arg subjectName ${shellQuote(subjectName)} --arg syntheticRootRef ${shellQuote(syntheticRootRef)} ${shellQuote(normalizeShapeFilter)} ${shellQuote(sbomPath)} > ${shellQuote(normalizedPath)}
+        filter_file=${shellQuote(filterPath)}
+        trap 'rm -f "\$filter_file"' EXIT
+
+        jq --arg subjectName ${shellQuote(subjectName)} --arg syntheticRootRef ${shellQuote(syntheticRootRef)} \
+            -f "\$filter_file" ${shellQuote(sbomPath)} > ${shellQuote(normalizedPath)}
+
+        rm -f "\$filter_file"
+        trap - EXIT
     """
 }
 
 def collectSbomGraphInfo(def normalizedPath) {
-    def graphInfoFilter = [
-        'def as_array:',
-        '  if . == null then []',
-        '  elif type == "array" then .',
-        '  elif type == "object" then [.]',
-        '  else [] end;',
-        '',
-        'def component_objects($items):',
-        '  ($items | as_array)[]?',
-        '  | select(type == "object")',
-        '  | ., component_objects(.components);',
-        '',
-        'def direct_refs:',
-        '  [',
-        '    ((.components | as_array)[]? | select(type == "object") | .["bom-ref"]),',
-        '    ((.services | as_array)[]? | select(type == "object") | .["bom-ref"])',
-        '  ]',
-        '  | map(select(. != null and (tostring | length > 0)) | tostring);',
-        '',
-        'def known_refs:',
-        '  [',
-        '    (component_objects(.components) | .["bom-ref"]),',
-        '    ((.services | as_array)[]? | select(type == "object") | .["bom-ref"])',
-        '  ]',
-        '  | map(select(. != null and (tostring | length > 0)) | tostring);',
-        '',
-        '(.metadata.component["bom-ref"] // "" | tostring) as $rootRef',
-        '| "ROOT\\t\\($rootRef)",',
-        '  (direct_refs[] | "DIRECT\\t\\(.)"),',
-        '  (known_refs[] | "KNOWN\\t\\(.)"),',
-        '  ((.dependencies | as_array)[]? | select(type == "object") | (.ref // "" | tostring) as $ref | select($ref != "") | "DEP\\t\\($ref)"),',
-        '  ((.dependencies | as_array)[]? | select(type == "object") | (.ref // "" | tostring) as $ref | select($ref != "") | (.dependsOn | as_array)[]? | tostring | "EDGE\\t\\($ref)\\t\\(.)")'
-    ].join("\n")
+    def graphInfoFilter = '''
+        def as_array:
+          if . == null then []
+          elif type == "array" then .
+          elif type == "object" then [.]
+          else [] end;
 
-    return parseSbomGraphInfo(sh(
-        script: "jq -r ${shellQuote(graphInfoFilter)} ${shellQuote(normalizedPath)}",
-        returnStdout: true
-    ))
+        def component_objects($items):
+          ($items | as_array)[]?
+          | select(type == "object")
+          | ., component_objects(.components);
+
+        def direct_refs:
+          [
+            ((.components | as_array)[]? | select(type == "object") | .["bom-ref"]),
+            ((.services | as_array)[]? | select(type == "object") | .["bom-ref"])
+          ]
+          | map(select(. != null and (tostring | length > 0)) | tostring);
+
+        def known_refs:
+          [
+            (component_objects(.components) | .["bom-ref"]),
+            ((.services | as_array)[]? | select(type == "object") | .["bom-ref"])
+          ]
+          | map(select(. != null and (tostring | length > 0)) | tostring);
+
+        (.metadata.component["bom-ref"] // "" | tostring) as $rootRef
+        | "ROOT\\t\\($rootRef)",
+          (direct_refs[] | "DIRECT\\t\\(.)"),
+          (known_refs[] | "KNOWN\\t\\(.)"),
+          ((.dependencies | as_array)[]? | select(type == "object") | (.ref // "" | tostring) as $ref | select($ref != "") | "DEP\\t\\($ref)"),
+          ((.dependencies | as_array)[]? | select(type == "object") | (.ref // "" | tostring) as $ref | select($ref != "") | (.dependsOn | as_array)[]? | tostring | "EDGE\\t\\($ref)\\t\\(.)")
+    '''
+    def filterPath = "${normalizedPath}.graph-info-${UUID.randomUUID().toString()}.jq"
+    writeJqFilterFile(filterPath, graphInfoFilter)
+
+    try {
+        return parseSbomGraphInfo(sh(
+            script: """
+                set -e
+                jq -r -f ${shellQuote(filterPath)} ${shellQuote(normalizedPath)}
+            """,
+            returnStdout: true
+        ))
+    } finally {
+        sh "rm -f ${shellQuote(filterPath)}"
+    }
 }
 
 void applyNormalizedDependencyGraph(def normalizedPath, def rootRef, def rootDependsOn, def leafRefs) {
-    def dependencyGraphFilter = [
-        'def as_array:',
-        '  if . == null then []',
-        '  elif type == "array" then .',
-        '  else [] end;',
-        '',
-        '($rootDependsOn[0]) as $rootChildren',
-        '| ($leafRefs[0]) as $leafs',
-        '| (.dependencies | as_array | map(select(type == "object"))) as $deps',
-        '| ($deps | map(select((.ref // "" | tostring) == $rootRef)) | first // {ref: $rootRef}) as $rootDependency',
-        '| .dependencies = (',
-        '    [($rootDependency | .ref = $rootRef | .dependsOn = $rootChildren)]',
-        '    + ($deps | map(select((.ref // "" | tostring) != $rootRef)))',
-        '    + ($leafs | map({ref: .}))',
-        '  )'
-    ].join("\n")
+    def dependencyGraphFilter = '''
+        def as_array:
+          if . == null then []
+          elif type == "array" then .
+          else [] end;
+
+        ($rootDependsOn[0]) as $rootChildren
+        | ($leafRefs[0]) as $leafs
+        | (.dependencies | as_array | map(select(type == "object"))) as $deps
+        | ($deps | map(select((.ref // "" | tostring) == $rootRef)) | first // {ref: $rootRef}) as $rootDependency
+        | .dependencies = (
+            [($rootDependency | .ref = $rootRef | .dependsOn = $rootChildren)]
+            + ($deps | map(select((.ref // "" | tostring) != $rootRef)))
+            + ($leafs | map({ref: .}))
+          )
+    '''
     def rootDependsOnPath = "${normalizedPath}.root-depends-on-${UUID.randomUUID().toString()}.json"
     def leafRefsPath = "${normalizedPath}.leaf-refs-${UUID.randomUUID().toString()}.json"
     def tmpPath = "${normalizedPath}.deps-${UUID.randomUUID().toString()}.tmp"
+    def filterPath = "${normalizedPath}.dependencies-${UUID.randomUUID().toString()}.jq"
 
     writeJsonArrayFile(rootDependsOnPath, rootDependsOn)
     writeJsonArrayFile(leafRefsPath, leafRefs)
+    writeJqFilterFile(filterPath, dependencyGraphFilter)
 
     // jq применяет рассчитанные Groovy списки к BOM и пишет новую копию атомарной заменой.
     sh """
@@ -1352,12 +1384,14 @@ void applyNormalizedDependencyGraph(def normalizedPath, def rootRef, def rootDep
         tmp_file=${shellQuote(tmpPath)}
         root_depends_on_file=${shellQuote(rootDependsOnPath)}
         leaf_refs_file=${shellQuote(leafRefsPath)}
-        trap 'rm -f "\$tmp_file" "\$root_depends_on_file" "\$leaf_refs_file"' EXIT
+        filter_file=${shellQuote(filterPath)}
+        trap 'rm -f "\$tmp_file" "\$root_depends_on_file" "\$leaf_refs_file" "\$filter_file"' EXIT
 
-        jq --arg rootRef ${shellQuote(rootRef)} --slurpfile rootDependsOn "\$root_depends_on_file" --slurpfile leafRefs "\$leaf_refs_file" ${shellQuote(dependencyGraphFilter)} ${shellQuote(normalizedPath)} > "\$tmp_file"
+        jq --arg rootRef ${shellQuote(rootRef)} --slurpfile rootDependsOn "\$root_depends_on_file" \
+            --slurpfile leafRefs "\$leaf_refs_file" -f "\$filter_file" ${shellQuote(normalizedPath)} > "\$tmp_file"
 
         mv "\$tmp_file" ${shellQuote(normalizedPath)}
-        rm -f "\$root_depends_on_file" "\$leaf_refs_file"
+        rm -f "\$root_depends_on_file" "\$leaf_refs_file" "\$filter_file"
         trap - EXIT
     """
 }
@@ -1520,6 +1554,13 @@ def as_array:
     def tmpNextPath = "${tmpPath}.next"
     def rootComponentPath = "${sbomPath}.root-component-${UUID.randomUUID().toString()}.tmp"
     def rootRefsPath = "${sbomPath}.root-refs-${UUID.randomUUID().toString()}.tmp"
+    def rootAliasesFilterPath = "${sbomPath}.root-aliases-${UUID.randomUUID().toString()}.jq"
+    def replaceRootComponentFilterPath = "${sbomPath}.replace-root-${UUID.randomUUID().toString()}.jq"
+    def cleanupRootDependencyFilterPath = "${sbomPath}.cleanup-root-${UUID.randomUUID().toString()}.jq"
+
+    writeJqFilterFile(rootAliasesFilterPath, rootAliasesFilter)
+    writeJqFilterFile(replaceRootComponentFilterPath, replaceRootComponentFilter)
+    writeJqFilterFile(cleanupRootDependencyFilterPath, cleanupRootDependencyFilter)
 
     // Финальный cleanup делаем через jq, чтобы Jenkins/Groovy не поднимал большой merged BOM в память.
     // Каждый jq-фильтр делает один маленький шаг: достать root, заменить metadata/component, почистить root dependency.
@@ -1531,22 +1572,25 @@ def as_array:
         next_file=${shellQuote(tmpNextPath)}
         root_component_file=${shellQuote(rootComponentPath)}
         root_refs_file=${shellQuote(rootRefsPath)}
-        trap 'rm -f "\$tmp_file" "\$next_file" "\$root_component_file" "\$root_refs_file"' EXIT
+        root_aliases_filter_file=${shellQuote(rootAliasesFilterPath)}
+        replace_root_filter_file=${shellQuote(replaceRootComponentFilterPath)}
+        cleanup_root_filter_file=${shellQuote(cleanupRootDependencyFilterPath)}
+        trap 'rm -f "\$tmp_file" "\$next_file" "\$root_component_file" "\$root_refs_file" "\$root_aliases_filter_file" "\$replace_root_filter_file" "\$cleanup_root_filter_file"' EXIT
 
         jq -e '.metadata.component | select(type == "object" and (."bom-ref" // "" | tostring | length > 0))' \
             ${shellQuote(sbomTemplatePath)} > "\$root_component_file"
 
-        jq --slurpfile root "\$root_component_file" ${shellQuote(rootAliasesFilter)} \
+        jq --slurpfile root "\$root_component_file" -f "\$root_aliases_filter_file" \
             ${shellQuote(sbomPath)} > "\$root_refs_file"
 
         jq --slurpfile root "\$root_component_file" --slurpfile rootRefs "\$root_refs_file" \
-            ${shellQuote(replaceRootComponentFilter)} ${shellQuote(sbomPath)} > "\$tmp_file"
+            -f "\$replace_root_filter_file" ${shellQuote(sbomPath)} > "\$tmp_file"
 
         jq --slurpfile root "\$root_component_file" --slurpfile rootRefs "\$root_refs_file" \
-            ${shellQuote(cleanupRootDependencyFilter)} "\$tmp_file" > "\$next_file"
+            -f "\$cleanup_root_filter_file" "\$tmp_file" > "\$next_file"
 
         mv "\$next_file" ${shellQuote(sbomPath)}
-        rm -f "\$tmp_file" "\$root_component_file" "\$root_refs_file"
+        rm -f "\$tmp_file" "\$root_component_file" "\$root_refs_file" "\$root_aliases_filter_file" "\$replace_root_filter_file" "\$cleanup_root_filter_file"
 
         trap - EXIT
     """
