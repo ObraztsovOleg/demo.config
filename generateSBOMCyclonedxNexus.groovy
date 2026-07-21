@@ -1305,13 +1305,9 @@ void normalizeSbomJsonShape(def sbomPath, def normalizedPath, def subjectName, d
         set -e
         command -v jq >/dev/null 2>&1 || { echo 'SBOM hierarchical normalize requires jq'; exit 1; }
         filter_file=${shellQuote(filterPath)}
-        trap 'rm -f "\$filter_file"' EXIT
 
         jq --arg subjectName ${shellQuote(subjectName)} --arg syntheticRootRef ${shellQuote(syntheticRootRef)} \
             -f "\$filter_file" ${shellQuote(sbomPath)} > ${shellQuote(normalizedPath)}
-
-        rm -f "\$filter_file"
-        trap - EXIT
     """)
 }
 
@@ -1352,17 +1348,13 @@ def collectSbomGraphInfo(def normalizedPath) {
     def filterPath = "${normalizedPath}.graph-info-${UUID.randomUUID().toString()}.jq"
     writeJqFilterFile(filterPath, graphInfoFilter)
 
-    try {
-        return parseSbomGraphInfo(sh(
-            script: shellScript("""
-                set -e
-                jq -r -f ${shellQuote(filterPath)} ${shellQuote(normalizedPath)}
-            """),
-            returnStdout: true
-        ))
-    } finally {
-        sh "rm -f ${shellQuote(filterPath)}"
-    }
+    return parseSbomGraphInfo(sh(
+        script: shellScript("""
+            set -e
+            jq -r -f ${shellQuote(filterPath)} ${shellQuote(normalizedPath)}
+        """),
+        returnStdout: true
+    ))
 }
 
 void applyNormalizedDependencyGraph(def normalizedPath, def rootRef, def rootDependsOn, def leafRefs) {
@@ -1398,14 +1390,11 @@ void applyNormalizedDependencyGraph(def normalizedPath, def rootRef, def rootDep
         root_depends_on_file=${shellQuote(rootDependsOnPath)}
         leaf_refs_file=${shellQuote(leafRefsPath)}
         filter_file=${shellQuote(filterPath)}
-        trap 'rm -f "\$tmp_file" "\$root_depends_on_file" "\$leaf_refs_file" "\$filter_file"' EXIT
 
         jq --arg rootRef ${shellQuote(rootRef)} --slurpfile rootDependsOn "\$root_depends_on_file" \
             --slurpfile leafRefs "\$leaf_refs_file" -f "\$filter_file" ${shellQuote(normalizedPath)} > "\$tmp_file"
 
         mv "\$tmp_file" ${shellQuote(normalizedPath)}
-        rm -f "\$root_depends_on_file" "\$leaf_refs_file" "\$filter_file"
-        trap - EXIT
     """)
 }
 
@@ -1422,7 +1411,6 @@ def normalizeSbomForHierarchicalMerge(def sbomPath, def normalizedDir, int index
     if (!rootRef) {
         // Пустой BOM без subject и inventory не несет информации, поэтому его безопасно пропустить.
         echo("SBOM MERGE hierarchical skip: ${sbomPath}, reason=no metadata component and empty inventory")
-        sh "rm -f ${shellQuote(normalizedPath)}"
         return null
     }
 
@@ -1588,7 +1576,6 @@ void finalizeHierarchicalSbom(def sbomPath, def sbomTemplatePath) {
         root_aliases_filter_file=${shellQuote(rootAliasesFilterPath)}
         replace_root_filter_file=${shellQuote(replaceRootComponentFilterPath)}
         cleanup_root_filter_file=${shellQuote(cleanupRootDependencyFilterPath)}
-        trap 'rm -f "\$tmp_file" "\$next_file" "\$root_component_file" "\$root_refs_file" "\$root_aliases_filter_file" "\$replace_root_filter_file" "\$cleanup_root_filter_file"' EXIT
 
         jq -e '.metadata.component | select(type == "object" and (."bom-ref" // "" | tostring | length > 0))' \
             ${shellQuote(sbomTemplatePath)} > "\$root_component_file"
@@ -1603,9 +1590,6 @@ void finalizeHierarchicalSbom(def sbomPath, def sbomTemplatePath) {
             -f "\$cleanup_root_filter_file" "\$tmp_file" > "\$next_file"
 
         mv "\$next_file" ${shellQuote(sbomPath)}
-        rm -f "\$tmp_file" "\$root_component_file" "\$root_refs_file" "\$root_aliases_filter_file" "\$replace_root_filter_file" "\$cleanup_root_filter_file"
-
-        trap - EXIT
     """)
 }
 
