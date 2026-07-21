@@ -56,6 +56,16 @@ build:
     create_tag: false
     sonarSkip: true
     skip_rn: true
+
+  python.sbom.sample:
+    builder: jenkinsfile
+    repo: ssh://git@github.com/ObraztsovOleg/demo.config.git
+    branch: sbom-go-node-test
+    script_path: Jenkinsfile
+    update_version: false
+    create_tag: false
+    sonarSkip: true
+    skip_rn: true
     
 nexus:
   creds: "deploy-creds" # id (создадим позже) ТУЗа, c доступом на чтение из:
@@ -90,12 +100,13 @@ extensions:
     cdxgen_path: cdxgen
     cyclonedx_cli: cyclonedx-cli-0.32.0
     cyclonedx_cli_path: cyclonedx
-    parallel: true
+    parallel: false
     args:
       - "-t java"
       - "-t jar"
       - "-t js"
       - "-t go"
+      - "-t python"
 
 disabled_extensions:
   - "makeReleaseNotes"
