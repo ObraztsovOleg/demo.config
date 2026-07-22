@@ -1520,6 +1520,10 @@ void finalizeHierarchicalSbom(def sbomPath, def sbomTemplatePath) {
               "ref:" + (.["bom-ref"] | text)
             end;
 
+        def canonical_ref:
+          (.purl | text) as $purl
+          | if $purl != "" then $purl else (.["bom-ref"] | text) end;
+
         def rewrite_ref($aliases):
           tostring as $ref | ($aliases[$ref] // $ref);
 
@@ -1528,7 +1532,7 @@ void finalizeHierarchicalSbom(def sbomPath, def sbomTemplatePath) {
         | ($components
             | group_by(component_key)
             | map(
-                (.[0]["bom-ref"] | text) as $canonicalRef
+                (.[0] | canonical_ref) as $canonicalRef
                 | .[]
                 | (.["bom-ref"] | text) as $ref
                 | select($ref != "" and $canonicalRef != "" and $ref != $canonicalRef)
@@ -1538,7 +1542,7 @@ void finalizeHierarchicalSbom(def sbomPath, def sbomTemplatePath) {
         | .components = (
             $components
             | group_by(component_key)
-            | map(.[0] | del(.components))
+            | map(.[0] | .["bom-ref"] = canonical_ref | del(.components))
           )
         | .dependencies = (
             (.dependencies | as_array | map(select(type == "object")))
