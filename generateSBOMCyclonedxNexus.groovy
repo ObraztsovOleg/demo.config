@@ -73,10 +73,9 @@ def getCyclonedxCliArgs(def extension) {
     return extension.cyclonedx_cli_args instanceof String ? [extension.cyclonedx_cli_args] : normalizeList(extension.cyclonedx_cli_args)
 }
 
-// Hierarchical merge нужен всегда; если пользователь уже добавил --hierarchical в cyclonedx_cli_args, не дублируем его.
-def getHierarchicalMergeCliArgs(def cyclonedxCliArgs) {
-    def userArgs = normalizeList(cyclonedxCliArgs).collect { it?.toString()?.trim() }.findAll { it }
-    return (userArgs.contains("--hierarchical") ? [] : ["--hierarchical"]) + userArgs
+// В merge передаем только аргументы, явно заданные пользователем в extension.cyclonedx_cli_args.
+def getCyclonedxMergeCliArgs(def cyclonedxCliArgs) {
+    return normalizeList(cyclonedxCliArgs).collect { it?.toString()?.trim() }.findAll { it }
 }
 
 // Сохраняет совместимость обертки инструментов и настроек NodeJS с исходным SBOM-скриптом.
@@ -1456,10 +1455,10 @@ def prepareHierarchicalMergeInputs(def inputFiles, def globals) {
 void mergeHierarchicalSbomFiles(def inputFiles, def outputPath, def cyclonedxCliPath, def specVersion, def sbomTemplatePath, def cyclonedxCliArgs = []) {
     // Создаем папку результата перед запуском CLI.
     ensureParentDirectory(outputPath)
-    def mergeCliArgs = getHierarchicalMergeCliArgs(cyclonedxCliArgs).collect { shellQuote(it) }.join(' ')
+    def mergeCliArgs = getCyclonedxMergeCliArgs(cyclonedxCliArgs).collect { shellQuote(it) }.join(' ')
 
     // Единственное место, где строится общая hierarchy между BOM:
-    // template и каждый input BOM передаются в штатный cyclonedx-cli merge --hierarchical.
+    // template и каждый input BOM передаются в штатный cyclonedx-cli merge, а --hierarchical приходит из cyclonedx_cli_args.
     sh shellScript("""
         command -v jq >/dev/null 2>&1 || { echo 'SBOM hierarchical merge requires jq'; exit 1; }
 
