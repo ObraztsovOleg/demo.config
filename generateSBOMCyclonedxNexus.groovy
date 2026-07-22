@@ -1159,21 +1159,23 @@ def parseSbomGraphInfo(def graphText) {
 
 def collectReachableGraphRefs(def edges, def rootRef, def rootDependsOn) {
     def reachable = new LinkedHashSet()
-    def queue = new ArrayDeque()
+    def queue = []
+    def queueIndex = 0
     if (rootRef) {
         // Обход всегда начинается от subject/root текущего input BOM.
         reachable << rootRef
-        queue.add(rootRef)
+        queue << rootRef
     }
 
     // Обычный BFS по dependsOn, чтобы понять какие refs реально достижимы от root.
-    while (!queue.isEmpty()) {
-        def ref = queue.removeFirst()
+    while (queueIndex < queue.size()) {
+        def ref = queue[queueIndex]
+        queueIndex++
         def childRefs = ref == rootRef ? rootDependsOn : edges[ref]
         childRefs.each { childRef ->
             if (!reachable.contains(childRef)) {
                 reachable << childRef
-                queue.add(childRef)
+                queue << childRef
             }
         }
     }
