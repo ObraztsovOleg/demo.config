@@ -1157,32 +1157,6 @@ def parseSbomGraphInfo(def graphText) {
     return info
 }
 
-def collectReachableGraphRefs(def edges, def rootRef, def rootDependsOn) {
-    def reachable = new LinkedHashSet()
-    def queue = []
-    def queueIndex = 0
-    if (rootRef) {
-        // Обход всегда начинается от subject/root текущего input BOM.
-        reachable << rootRef
-        queue << rootRef
-    }
-
-    // Обычный BFS по dependsOn, чтобы понять какие refs реально достижимы от root.
-    while (queueIndex < queue.size()) {
-        def ref = queue[queueIndex]
-        queueIndex++
-        def childRefs = ref == rootRef ? rootDependsOn : edges[ref]
-        childRefs.each { childRef ->
-            if (!reachable.contains(childRef)) {
-                reachable << childRef
-                queue << childRef
-            }
-        }
-    }
-
-    return reachable
-}
-
 def getPreparedDependencyGraph(def info) {
     def rootRef = info.rootRef
     def rootDependsOn = new LinkedHashSet(info.edges[rootRef] ?: [])
@@ -1201,14 +1175,6 @@ def getPreparedDependencyGraph(def info) {
         }
         def fallbackRefs = graphRoots ?: info.directRefs.findAll { it != rootRef }
         fallbackRefs.each { ref -> rootDependsOn << ref }
-    }
-
-    def reachable = collectReachableGraphRefs(info.edges, rootRef, rootDependsOn)
-
-    // Недостижимые inventory refs подвешиваем напрямую к root.
-    // Это не выдумывает transitive edges, а только не дает итоговому SBOM "обрываться".
-    info.knownRefs.findAll { ref -> ref != rootRef && !reachable.contains(ref) }.each { ref ->
-        rootDependsOn << ref
     }
 
     // CycloneDX отличает "нет dependency entry" от "точно нет зависимостей".
@@ -1532,6 +1498,99 @@ void finalizeHierarchicalSbom(def sbomPath, def sbomTemplatePath) {
               )
           )
     '''
+    def canonicalizeComponentRefsFilter = '''
+        def as_array:
+          if . == null then []
+          elif type == "array" then .
+          else [] end;
+
+        def text:
+          if . == null then "" else tostring end;
+
+        def component_objects:
+          (.components | as_array)[]?
+          | select(type == "object")
+          | ., (. | component_objects);
+
+        def component_key:
+          (.purl | text) as $purl
+          | if $purl != "" then
+              "purl:" + $purl
+            else
+              ([.type, .group, .name, .version] | map(text)) as $parts
+              | if (($parts | join("")) != "" ) then
+                  "gav:" + ($parts | join("|"))
+                else
+                  "ref:" + (.["bom-ref"] | text)
+                end
+            end;
+
+        def rewrite_ref($aliases):
+          tostring as $ref | ($aliases[$ref] // $ref);
+
+        ([component_objects | select((.["bom-ref"] | text) != "")]
+          | sort_by(component_key)) as $components
+        | ($components
+            | group_by(component_key)
+            | map(
+                (.[0]["bom-ref"] | text) as $canonicalRef
+                | .[]
+                | (.["bom-ref"] | text) as $ref
+                | select($ref != "" and $canonicalRef != "" and $ref != $canonicalRef)
+                | {($ref): $canonicalRef}
+              )
+            | add // {}) as $aliases
+        | .components = (
+            $components
+            | group_by(component_key)
+            | map(.[0] | del(.components))
+          )
+        | .dependencies = (
+            (.dependencies | as_array | map(select(type == "object")))
+            | map(
+                (.ref | text | rewrite_ref($aliases)) as $ref
+                | .ref = $ref
+                | .dependsOn = (
+                    (.dependsOn | as_array)
+                    | map(rewrite_ref($aliases))
+                    | map(select(. != "" and . != $ref))
+                    | unique
+                  )
+                | if has("provides") then
+                    .provides = (
+                      (.provides | as_array)
+                      | map(rewrite_ref($aliases))
+                      | map(select(. != "" and . != $ref))
+                      | unique
+                    )
+                  else . end
+              )
+            | sort_by(.ref)
+            | group_by(.ref)
+            | map(
+                .[0] as $first
+                | ([.[] | (.dependsOn | as_array)[]?] | unique) as $dependsOn
+                | ([.[] | (.provides | as_array)[]?] | unique) as $provides
+                | ($first | del(.dependsOn, .provides))
+                | .dependsOn = $dependsOn
+                | if ($provides | length) > 0 then .provides = $provides else del(.provides) end
+              )
+          )
+        | if (.vulnerabilities | type) == "array" then
+            .vulnerabilities |= map(
+              if type == "object" and has("affects") then
+                .affects = (
+                  (.affects | as_array)
+                  | map(
+                      if type == "object" then
+                        .ref = ((.ref | text) | rewrite_ref($aliases))
+                      else . end
+                    )
+                )
+              else . end
+            )
+          else . end
+    '''
     def cleanupRootDependencyFilter = '''
         def as_array:
           if . == null then []
@@ -1558,14 +1617,16 @@ void finalizeHierarchicalSbom(def sbomPath, def sbomTemplatePath) {
     def rootRefsPath = "${sbomPath}.root-refs-${UUID.randomUUID().toString()}.tmp"
     def rootAliasesFilterPath = "${sbomPath}.root-aliases-${UUID.randomUUID().toString()}.jq"
     def replaceRootComponentFilterPath = "${sbomPath}.replace-root-${UUID.randomUUID().toString()}.jq"
+    def canonicalizeComponentRefsFilterPath = "${sbomPath}.canonicalize-refs-${UUID.randomUUID().toString()}.jq"
     def cleanupRootDependencyFilterPath = "${sbomPath}.cleanup-root-${UUID.randomUUID().toString()}.jq"
 
     writeJqFilterFile(rootAliasesFilterPath, rootAliasesFilter)
     writeJqFilterFile(replaceRootComponentFilterPath, replaceRootComponentFilter)
+    writeJqFilterFile(canonicalizeComponentRefsFilterPath, canonicalizeComponentRefsFilter)
     writeJqFilterFile(cleanupRootDependencyFilterPath, cleanupRootDependencyFilter)
 
     // Финальный cleanup делаем через jq, чтобы Jenkins/Groovy не поднимал большой merged BOM в память.
-    // Каждый jq-фильтр делает один маленький шаг: достать root, заменить metadata/component, почистить root dependency.
+    // Каждый jq-фильтр делает один маленький шаг: root, component refs, root dependency.
     sh shellScript("""
         set -e
         command -v jq >/dev/null 2>&1 || { echo 'SBOM hierarchical finalize requires jq'; exit 1; }
@@ -1576,6 +1637,7 @@ void finalizeHierarchicalSbom(def sbomPath, def sbomTemplatePath) {
         root_refs_file="${rootRefsPath}"
         root_aliases_filter_file="${rootAliasesFilterPath}"
         replace_root_filter_file="${replaceRootComponentFilterPath}"
+        canonicalize_refs_filter_file="${canonicalizeComponentRefsFilterPath}"
         cleanup_root_filter_file="${cleanupRootDependencyFilterPath}"
 
         jq -e '.metadata.component | select(type == "object" and (."bom-ref" // "" | tostring | length > 0))' \
@@ -1586,6 +1648,9 @@ void finalizeHierarchicalSbom(def sbomPath, def sbomTemplatePath) {
 
         jq --slurpfile root "\$root_component_file" --slurpfile rootRefs "\$root_refs_file" \
             -f "\$replace_root_filter_file" "${sbomPath}" > "\$tmp_file"
+
+        jq -f "\$canonicalize_refs_filter_file" "\$tmp_file" > "\$next_file"
+        mv "\$next_file" "\$tmp_file"
 
         jq --slurpfile root "\$root_component_file" --slurpfile rootRefs "\$root_refs_file" \
             -f "\$cleanup_root_filter_file" "\$tmp_file" > "\$next_file"
