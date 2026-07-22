@@ -65,6 +65,7 @@ extensions:
     cdxgen_path: cdxgen
     cyclonedx_cli: cyclonedx-cli-0.32.0
     cyclonedx_cli_path: cyclonedx
+    cyclonedx_cli_args: []
     parallel: true
     args:
       - "-t java"

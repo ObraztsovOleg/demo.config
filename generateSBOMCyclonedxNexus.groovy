@@ -68,6 +68,17 @@ def shellQuote(def value) {
     return "'${value.toString().replace("'", "'\"'\"'")}'"
 }
 
+// extension.cyclonedx_cli_args передаётся прямо в cyclonedx-cli merge; по умолчанию это пустой массив.
+def getCyclonedxCliArgs(def extension) {
+    return extension.cyclonedx_cli_args instanceof String ? [extension.cyclonedx_cli_args] : normalizeList(extension.cyclonedx_cli_args)
+}
+
+// Hierarchical merge нужен всегда; если пользователь уже добавил --hierarchical в cyclonedx_cli_args, не дублируем его.
+def getHierarchicalMergeCliArgs(def cyclonedxCliArgs) {
+    def userArgs = normalizeList(cyclonedxCliArgs).collect { it?.toString()?.trim() }.findAll { it }
+    return (userArgs.contains("--hierarchical") ? [] : ["--hierarchical"]) + userArgs
+}
+
 // Сохраняет совместимость обертки инструментов и настроек NodeJS с исходным SBOM-скриптом.
 def wrapNodejs(def config, extension, def closure) {
     def result = closure
@@ -1442,9 +1453,10 @@ def prepareHierarchicalMergeInputs(def inputFiles, def globals) {
     return result.unique()
 }
 
-void mergeHierarchicalSbomFiles(def inputFiles, def outputPath, def cyclonedxCliPath, def specVersion, def sbomTemplatePath) {
+void mergeHierarchicalSbomFiles(def inputFiles, def outputPath, def cyclonedxCliPath, def specVersion, def sbomTemplatePath, def cyclonedxCliArgs = []) {
     // Создаем папку результата перед запуском CLI.
     ensureParentDirectory(outputPath)
+    def mergeCliArgs = getHierarchicalMergeCliArgs(cyclonedxCliArgs).collect { shellQuote(it) }.join(' ')
 
     // Единственное место, где строится общая hierarchy между BOM:
     // template и каждый input BOM передаются в штатный cyclonedx-cli merge --hierarchical.
@@ -1465,7 +1477,7 @@ void mergeHierarchicalSbomFiles(def inputFiles, def outputPath, def cyclonedxCli
             --output-file ${shellQuote(outputPath)} \
             --output-format json \
             --output-version ${specVersion} \
-            --hierarchical \
+            ${mergeCliArgs} \
             --group "\$root_group" \
             --name "\$root_name" \
             --version "\$root_version"
@@ -1594,7 +1606,7 @@ void finalizeHierarchicalSbom(def sbomPath, def sbomTemplatePath) {
 }
 
 // hierarchical merge должен видеть template и каждый входной SBOM как отдельные subjects; graph строит cyclonedx-cli.
-void mergeSbomFiles(def inputFiles, def mergedPath, def specVersion, def cyclonedxCliPath, def globals, boolean parallelMergeEnabled, def sbomTemplatePath) {
+void mergeSbomFiles(def inputFiles, def mergedPath, def specVersion, def cyclonedxCliPath, def globals, boolean parallelMergeEnabled, def sbomTemplatePath, def cyclonedxCliArgs = []) {
     // Все реальные входные BOM нормализуются до запуска CLI.
     def files = prepareHierarchicalMergeInputs(inputFiles, globals)
 
@@ -1604,7 +1616,7 @@ void mergeSbomFiles(def inputFiles, def mergedPath, def specVersion, def cyclone
     echo("SBOM MERGE hierarchical: files=${mergeFiles.size()}, parallel_merge=${parallelMergeEnabled}, output=${mergedPath}")
 
     // Общий graph строит cyclonedx-cli --hierarchical.
-    mergeHierarchicalSbomFiles(mergeFiles, mergedPath, cyclonedxCliPath, specVersion, sbomTemplatePath)
+    mergeHierarchicalSbomFiles(mergeFiles, mergedPath, cyclonedxCliPath, specVersion, sbomTemplatePath, cyclonedxCliArgs)
 
     // После CLI убираем только технические root-дубли и self-dependency.
     finalizeHierarchicalSbom(mergedPath, sbomTemplatePath)
@@ -1667,6 +1679,7 @@ void run(def extension, def extensionAPI) {
     def defaultSbomName = "sbom.json"
     def specVersion = extension.spec_version ?: "v1_6"
     def args = extension.args instanceof String ? [extension.args] : (extension.args ?: [])
+    def cyclonedxCliArgs = getCyclonedxCliArgs(extension)
     def sbomNames = extension.sbom_paths ?: [defaultSbomName]
     def sbomTemplatePath = "${globals.DIR_SRC}/sbomTemplate.json"
     def cdxgenPath = extension.cdxgen_path ?: "cdxgen-linux-x64"
@@ -1774,7 +1787,7 @@ void run(def extension, def extensionAPI) {
                 "save failed=${cacheSaveFailed}; Host scans=${hostScans}; merge files=${allSboms.size()}")
 
             def mergedPath = "${globals.DIR_SRC}/${defaultSbomName}"
-            mergeSbomFiles(allSboms, mergedPath, specVersion, cyclonedxCliPath, globals, parallelMergeEnabled, sbomTemplatePath)
+            mergeSbomFiles(allSboms, mergedPath, specVersion, cyclonedxCliPath, globals, parallelMergeEnabled, sbomTemplatePath, cyclonedxCliArgs)
 
             echo("SBOM файлы успешно объединены: files=${allSboms.size()}, output=${mergedPath}")
             if (sbomMergePaths.notExists) {
