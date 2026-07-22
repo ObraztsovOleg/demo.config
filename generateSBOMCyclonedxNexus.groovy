@@ -63,21 +63,6 @@ def getPathTail(def path) {
     return path?.toString()?.tokenize('/')?.last() ?: ""
 }
 
-// Экранирует путь для shell-команд, где список файлов собирается динамически.
-def shellQuote(def value) {
-    return "'${value.toString().replace("'", "'\"'\"'")}'"
-}
-
-// extension.cyclonedx_cli_args передаётся прямо в cyclonedx-cli merge; по умолчанию это пустой массив.
-def getCyclonedxCliArgs(def extension) {
-    return extension.cyclonedx_cli_args instanceof String ? [extension.cyclonedx_cli_args] : normalizeList(extension.cyclonedx_cli_args)
-}
-
-// В merge передаем только аргументы, явно заданные пользователем в extension.cyclonedx_cli_args.
-def getCyclonedxMergeCliArgs(def cyclonedxCliArgs) {
-    return normalizeList(cyclonedxCliArgs).collect { it?.toString()?.trim() }.findAll { it }
-}
-
 // Сохраняет совместимость обертки инструментов и настроек NodeJS с исходным SBOM-скриптом.
 def wrapNodejs(def config, extension, def closure) {
     def result = closure
@@ -911,7 +896,7 @@ def isNonEmptySbom(def sbomPath) {
     // Проверяем кешевый BOM через jq, чтобы не загружать JSON в Jenkins/Groovy.
     // jq -e возвращает 0 только если components является непустым массивом.
     def status = sh(
-        script: "jq -e '(.components // []) | type == \"array\" and length > 0' ${shellQuote(sbomPath)} >/dev/null 2>&1",
+        script: "jq -e '(.components // []) | type == \"array\" and length > 0' \"${sbomPath}\" >/dev/null 2>&1",
         returnStatus: true
     )
     if (status != 0) {
@@ -1100,7 +1085,7 @@ void runEntriesPhase(def phaseName, def entries, boolean parallelEnabled, def cl
 void ensureParentDirectory(def filePath) {
     def slashIndex = filePath.lastIndexOf("/")
     if (slashIndex > 0) {
-        sh "mkdir -p ${shellQuote(filePath.substring(0, slashIndex))}"
+        sh "mkdir -p \"${filePath.substring(0, slashIndex)}\""
     }
 }
 
@@ -1314,10 +1299,10 @@ void normalizeSbomJsonShape(def sbomPath, def normalizedPath, def subjectName, d
     sh shellScript("""
         set -e
         command -v jq >/dev/null 2>&1 || { echo 'SBOM hierarchical normalize requires jq'; exit 1; }
-        filter_file=${shellQuote(filterPath)}
+        filter_file="${filterPath}"
 
-        jq --arg subjectName ${shellQuote(subjectName)} --arg syntheticRootRef ${shellQuote(syntheticRootRef)} \
-            -f "\$filter_file" ${shellQuote(sbomPath)} > ${shellQuote(normalizedPath)}
+        jq --arg subjectName "${subjectName}" --arg syntheticRootRef "${syntheticRootRef}" \
+            -f "\$filter_file" "${sbomPath}" > "${normalizedPath}"
     """)
 }
 
@@ -1361,7 +1346,7 @@ def collectSbomGraphInfo(def normalizedPath) {
     return parseSbomGraphInfo(sh(
         script: shellScript("""
             set -e
-            jq -r -f ${shellQuote(filterPath)} ${shellQuote(normalizedPath)}
+            jq -r -f "${filterPath}" "${normalizedPath}"
         """),
         returnStdout: true
     ))
@@ -1396,15 +1381,15 @@ void applyNormalizedDependencyGraph(def normalizedPath, def rootRef, def rootDep
     // jq применяет рассчитанные Groovy списки к BOM и пишет новую копию атомарной заменой.
     sh shellScript("""
         set -e
-        tmp_file=${shellQuote(tmpPath)}
-        root_depends_on_file=${shellQuote(rootDependsOnPath)}
-        leaf_refs_file=${shellQuote(leafRefsPath)}
-        filter_file=${shellQuote(filterPath)}
+        tmp_file="${tmpPath}"
+        root_depends_on_file="${rootDependsOnPath}"
+        leaf_refs_file="${leafRefsPath}"
+        filter_file="${filterPath}"
 
-        jq --arg rootRef ${shellQuote(rootRef)} --slurpfile rootDependsOn "\$root_depends_on_file" \
-            --slurpfile leafRefs "\$leaf_refs_file" -f "\$filter_file" ${shellQuote(normalizedPath)} > "\$tmp_file"
+        jq --arg rootRef "${rootRef}" --slurpfile rootDependsOn "\$root_depends_on_file" \
+            --slurpfile leafRefs "\$leaf_refs_file" -f "\$filter_file" "${normalizedPath}" > "\$tmp_file"
 
-        mv "\$tmp_file" ${shellQuote(normalizedPath)}
+        mv "\$tmp_file" "${normalizedPath}"
     """)
 }
 
@@ -1441,7 +1426,7 @@ def prepareHierarchicalMergeInputs(def inputFiles, def globals) {
 
     // Все подготовленные BOM кладем в отдельную временную директорию текущего запуска.
     def normalizedDir = "${globals.DIR_TMP}/generateSBOMCyclonedx-hierarchical-${UUID.randomUUID().toString()}"
-    sh "mkdir -p ${shellQuote(normalizedDir)}"
+    sh "mkdir -p \"${normalizedDir}\""
 
     // Нормализуем каждый входной BOM отдельно и пропускаем только полностью пустые BOM.
     def result = []
@@ -1455,25 +1440,27 @@ def prepareHierarchicalMergeInputs(def inputFiles, def globals) {
 void mergeHierarchicalSbomFiles(def inputFiles, def outputPath, def cyclonedxCliPath, def specVersion, def sbomTemplatePath, def cyclonedxCliArgs = []) {
     // Создаем папку результата перед запуском CLI.
     ensureParentDirectory(outputPath)
-    def mergeCliArgs = getCyclonedxMergeCliArgs(cyclonedxCliArgs).collect { shellQuote(it) }.join(' ')
+    def mergeCliArgs = normalizeList(cyclonedxCliArgs).collect { it?.toString()?.trim() }.findAll { it }
+        .collect { "\"${it}\"" }.join(' ')
+    def mergeInputFiles = normalizeList(inputFiles).collect { "\"${it}\"" }.join(' ')
 
     // Единственное место, где строится общая hierarchy между BOM:
     // template и каждый input BOM передаются в штатный cyclonedx-cli merge, а --hierarchical приходит из cyclonedx_cli_args.
     sh shellScript("""
         command -v jq >/dev/null 2>&1 || { echo 'SBOM hierarchical merge requires jq'; exit 1; }
 
-        root_group=\$(jq -r '.metadata.component.group // ""' ${shellQuote(sbomTemplatePath)})
-        root_name=\$(jq -r '.metadata.component.name // ""' ${shellQuote(sbomTemplatePath)})
-        root_version=\$(jq -r '.metadata.component.version // ""' ${shellQuote(sbomTemplatePath)})
+        root_group=\$(jq -r '.metadata.component.group // ""' "${sbomTemplatePath}")
+        root_name=\$(jq -r '.metadata.component.name // ""' "${sbomTemplatePath}")
+        root_version=\$(jq -r '.metadata.component.version // ""' "${sbomTemplatePath}")
 
         if [ -z "\$root_name" ] || [ -z "\$root_version" ]; then
-            echo "SBOM hierarchical merge: root metadata component is missing name/version in ${shellQuote(sbomTemplatePath)}"
+            echo "SBOM hierarchical merge: root metadata component is missing name/version in ${sbomTemplatePath}"
             exit 1
         fi
 
         \${CYClONE_CLI}/${cyclonedxCliPath} merge \
-            --input-files ${normalizeList(inputFiles).collect { shellQuote(it) }.join(' ')} \
-            --output-file ${shellQuote(outputPath)} \
+            --input-files ${mergeInputFiles} \
+            --output-file "${outputPath}" \
             --output-format json \
             --output-version ${specVersion} \
             ${mergeCliArgs} \
@@ -1489,8 +1476,8 @@ void convertSbomFile(def sbomPath, def specVersion, def cyclonedxCliPath) {
     sh shellScript("""
         \${CYClONE_CLI}/${cyclonedxCliPath} convert \
             --output-version ${specVersion} \
-            --input-file ${shellQuote(sbomPath)} \
-            --output-file ${shellQuote(sbomPath)}
+            --input-file "${sbomPath}" \
+            --output-file "${sbomPath}"
     """)
 }
 
@@ -1580,27 +1567,27 @@ void finalizeHierarchicalSbom(def sbomPath, def sbomTemplatePath) {
         set -e
         command -v jq >/dev/null 2>&1 || { echo 'SBOM hierarchical finalize requires jq'; exit 1; }
 
-        tmp_file=${shellQuote(tmpPath)}
-        next_file=${shellQuote(tmpNextPath)}
-        root_component_file=${shellQuote(rootComponentPath)}
-        root_refs_file=${shellQuote(rootRefsPath)}
-        root_aliases_filter_file=${shellQuote(rootAliasesFilterPath)}
-        replace_root_filter_file=${shellQuote(replaceRootComponentFilterPath)}
-        cleanup_root_filter_file=${shellQuote(cleanupRootDependencyFilterPath)}
+        tmp_file="${tmpPath}"
+        next_file="${tmpNextPath}"
+        root_component_file="${rootComponentPath}"
+        root_refs_file="${rootRefsPath}"
+        root_aliases_filter_file="${rootAliasesFilterPath}"
+        replace_root_filter_file="${replaceRootComponentFilterPath}"
+        cleanup_root_filter_file="${cleanupRootDependencyFilterPath}"
 
         jq -e '.metadata.component | select(type == "object" and (."bom-ref" // "" | tostring | length > 0))' \
-            ${shellQuote(sbomTemplatePath)} > "\$root_component_file"
+            "${sbomTemplatePath}" > "\$root_component_file"
 
         jq --slurpfile root "\$root_component_file" -f "\$root_aliases_filter_file" \
-            ${shellQuote(sbomPath)} > "\$root_refs_file"
+            "${sbomPath}" > "\$root_refs_file"
 
         jq --slurpfile root "\$root_component_file" --slurpfile rootRefs "\$root_refs_file" \
-            -f "\$replace_root_filter_file" ${shellQuote(sbomPath)} > "\$tmp_file"
+            -f "\$replace_root_filter_file" "${sbomPath}" > "\$tmp_file"
 
         jq --slurpfile root "\$root_component_file" --slurpfile rootRefs "\$root_refs_file" \
             -f "\$cleanup_root_filter_file" "\$tmp_file" > "\$next_file"
 
-        mv "\$next_file" ${shellQuote(sbomPath)}
+        mv "\$next_file" "${sbomPath}"
     """)
 }
 
@@ -1678,7 +1665,8 @@ void run(def extension, def extensionAPI) {
     def defaultSbomName = "sbom.json"
     def specVersion = extension.spec_version ?: "v1_6"
     def args = extension.args instanceof String ? [extension.args] : (extension.args ?: [])
-    def cyclonedxCliArgs = getCyclonedxCliArgs(extension)
+    def cyclonedxCliArgs = extension.cyclonedx_cli_args instanceof String ?
+        [extension.cyclonedx_cli_args] : normalizeList(extension.cyclonedx_cli_args)
     def sbomNames = extension.sbom_paths ?: [defaultSbomName]
     def sbomTemplatePath = "${globals.DIR_SRC}/sbomTemplate.json"
     def cdxgenPath = extension.cdxgen_path ?: "cdxgen-linux-x64"
