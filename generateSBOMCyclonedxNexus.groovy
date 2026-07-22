@@ -259,29 +259,30 @@ def getPoms(def pomPaths) {
     }
 }
 
-// cyclonedx-cli hierarchical merge строит ref корневого компонента как group.name@version.
-def getRootSbomBomRef(def gavtc, def code) {
-    def group = gavtc.groupId?.toString()?.trim()
-    def name = code?.toString()?.trim()
-    def version = gavtc.version?.toString()?.trim()
-    def base = group ? "${group}.${name}" : name
-    return "${base}@${version}"
-}
-
 // Базовый компонент приложения в конце объединяется со всеми отсканированными SBOM проектов.
-void generateSBOMTemplate(String sbomTemplatePath, def gavtc, def code) {
-    def rootBomRef = getRootSbomBomRef(gavtc, code)
+void generateSBOMTemplate(String sbomTemplatePath, def gavtc, def code, def specVersion = "v1_6") {
+    def group = gavtc.groupId?.toString()?.trim()
+    def name = code?.toString()?.trim() ?: gavtc.artifactId?.toString()?.trim() ?: "application"
+    def version = gavtc.version?.toString()?.trim() ?: "0"
+    def artifactId = gavtc.artifactId?.toString()?.trim() ?: name
+    def rootBomRefName = group ? "${group}.${name}" : name
+    def rootBomRef = "${rootBomRefName}@${version}"
+    def purl = group ? "pkg:maven/${group}/${artifactId}@${version}" : "pkg:maven/${artifactId}@${version}"
+    def schemaVersion = specVersion?.toString()?.replaceFirst(/^v/, "")?.replace("_", ".") ?: "1.6"
+    def rootComponent = [
+        type: "application",
+        "bom-ref": rootBomRef,
+        name: name,
+        version: version,
+        purl: purl
+    ]
+    if (group) rootComponent.group = group
+
     writeJSON file: sbomTemplatePath, json: [
         bomFormat: "CycloneDX",
+        specVersion: schemaVersion,
         metadata: [
-            component: [
-                type: "application",
-                "bom-ref": rootBomRef,
-                group: gavtc.groupId,
-                name: code,
-                version: gavtc.version,
-                purl: "pkg:maven/${gavtc.groupId}.${gavtc.artifactId}@${gavtc.version}"
-            ]
+            component: rootComponent
         ],
         components: [],
         dependencies: []
@@ -431,8 +432,8 @@ def findSbomMergePaths(def extension, def defaultSbomName, def globals) {
     if (extension.sbom_merge_paths == null) {
         def defaultCustomSbomPath = "${globals.DIR_TMP_CONFIG}/${configDir}/additional_sbom.json"
         if (!fileExists(defaultCustomSbomPath)) {
-            echo("SBOM файл additional_sbom.json в корне репозитория с конфигурацией проекта " +
-                "для объединения со сгенерированным SBOM ${defaultSbomName} не найден")
+            echo("Опциональный SBOM additional_sbom.json в корне репозитория с конфигурацией проекта " +
+                "не найден, объединение с ним пропущено")
         } else {
             paths.exists << defaultCustomSbomPath
         }
@@ -1680,8 +1681,12 @@ void run(def extension, def extensionAPI) {
     gavtc.type = 'json'
     gavtc.classifier = extension.classifier ?: "cyclonedx-distrib"
     if (extension.version) gavtc.version = extension.version
+    if (!gavtc.groupId?.toString()?.trim()) gavtc.groupId = config.fp?.groupId ?: config.fp?.group_id ?: config.fp?.group ?: ""
+    if (!gavtc.artifactId?.toString()?.trim()) gavtc.artifactId = config.fp?.artifactId ?: config.fp?.artifact_id ?: config.fp?.component_code ?: "application"
+    if (!gavtc.version?.toString()?.trim()) gavtc.version = config.fp?.version ?: "0"
+    def rootComponentName = config.fp?.component_code ?: gavtc.artifactId
 
-    generateSBOMTemplate(sbomTemplatePath, gavtc, config.fp.component_code)
+    generateSBOMTemplate(sbomTemplatePath, gavtc, rootComponentName, specVersion)
 
     def runner = {
         def excludedSbomMap = [:]
