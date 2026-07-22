@@ -1517,12 +1517,7 @@ void finalizeHierarchicalSbom(def sbomPath, def sbomTemplatePath) {
           | if $purl != "" then
               "purl:" + $purl
             else
-              ([.type, .group, .name, .version] | map(text)) as $parts
-              | if (($parts | join("")) != "" ) then
-                  "gav:" + ($parts | join("|"))
-                else
-                  "ref:" + (.["bom-ref"] | text)
-                end
+              "ref:" + (.["bom-ref"] | text)
             end;
 
         def rewrite_ref($aliases):
